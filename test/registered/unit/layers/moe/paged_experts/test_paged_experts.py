@@ -15,7 +15,11 @@ from sglang.srt.layers.moe.paged_experts.residency import (
     LRUPolicy,
     plan_waves,
 )
-from sglang.srt.layers.moe.paged_experts.runners import MarlinContract, TritonContract
+from sglang.srt.layers.moe.paged_experts.runners import (
+    MarlinContract,
+    TritonContract,
+    XpuContract,
+)
 from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -157,6 +161,46 @@ class TestPagedForward(CustomTestCase):
                         self.assertLess(
                             method.base_method.rows, 2 * d.topk_output.topk_ids.numel()
                         )
+
+
+class TestXpuPagedForward(CustomTestCase):
+    def test_combined_kernel_merges_each_entry_once(self):
+        class Contract(XpuContract):
+            _sum_top_k = _sum_top_k
+
+        for num_tokens, padded in (
+            (1, False),
+            (2, False),
+            (64, False),
+            (3, True),
+            (1, True),
+        ):
+            with self.subTest(num_tokens=num_tokens, padded=padded):
+                method, layer, full = _paged_layer(Contract())
+                native = method.base_method.apply
+
+                def combined(layer, dispatch_output):
+                    partial = native(layer, dispatch_output).hidden_states
+                    return SimpleNamespace(hidden_states=partial.sum(1))
+
+                method.base_method.apply = combined
+                method.executor.routed_scaling_factor = 2.5
+                for _ in range(8):
+                    d = _step(num_tokens, padded=padded)
+                    out = method.apply(layer=layer, dispatch_output=d).hidden_states
+                    torch.testing.assert_close(out, _reference(full, d) * 2.5)
+
+    def test_native_kernel_does_not_apply_the_layer_scale_twice(self):
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+        original = MoeRunnerConfig(
+            num_experts=E, num_local_experts=E, routed_scaling_factor=2.5
+        )
+        config = XpuContract().runner_config(original, K)
+        self.assertEqual(config.num_local_experts, K)
+        self.assertFalse(config.no_combine)
+        self.assertEqual(config.routed_scaling_factor, 1.0)
+        self.assertEqual(original.routed_scaling_factor, 2.5)
 
 
 class TestLoading(CustomTestCase):
@@ -324,7 +368,23 @@ class TestDecodeCaptureCap(CustomTestCase):
 
 
 class TestCompat(CustomTestCase):
-    def _check(self, num_resident=K, speculative_algorithm=None):
+    def _check(
+        self,
+        num_resident=K,
+        speculative_algorithm=None,
+        xpu=False,
+        graphs=False,
+        prefill_graphs=False,
+        expert_format=None,
+    ):
+        from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+
+        def backend_check(phase, backend):
+            if not xpu:
+                return True
+            enabled = prefill_graphs if phase == Phase.PREFILL else graphs
+            return backend == (Backend.FULL if enabled else Backend.DISABLED)
+
         method = "sglang.srt.layers.moe.paged_experts.method."
         moe = SimpleNamespace(
             enable_eplb=False,
@@ -349,12 +409,48 @@ class TestCompat(CustomTestCase):
             patch(
                 method + "get_model", return_value=SimpleNamespace(load_format="auto")
             ),
-            patch(method + "check_cuda_graph_backend", return_value=True),
+            patch(method + "check_cuda_graph_backend", side_effect=backend_check),
+            patch(method + "get_platform", return_value=SimpleNamespace(is_xpu=xpu)),
+            patch(
+                method + "cuda_graph_fully_disabled",
+                return_value=not (graphs or prefill_graphs),
+            ),
+            patch(
+                method + "get_moe_runner_backend",
+                return_value=SimpleNamespace(is_triton=lambda: False),
+            ),
         ):
-            check_paged_experts_compat(layer=layer, expert_format=object())
+            check_paged_experts_compat(
+                layer=layer,
+                expert_format=expert_format
+                if expert_format is not None
+                else UnquantizedFormat(),
+            )
 
     def test_accepts_a_supported_config(self):
         self._check()
+
+    def test_xpu_accepts_eager_bf16(self):
+        self._check(xpu=True)
+
+    def test_xpu_accepts_block_fp8_decode_graph(self):
+        from sglang.srt.layers.moe.paged_experts.formats import Fp8BlockFormat
+
+        self._check(xpu=True, graphs=True, expert_format=Fp8BlockFormat())
+
+    def test_xpu_rejects_prefill_graphs(self):
+        with self.assertRaisesRegex(RuntimeError, "prefill graphs must be disabled"):
+            self._check(xpu=True, prefill_graphs=True)
+
+    def test_xpu_decode_graph_requires_block_fp8(self):
+        with self.assertRaisesRegex(RuntimeError, "require block-FP8"):
+            self._check(xpu=True, graphs=True)
+
+    def test_xpu_rejects_marlin_formats(self):
+        from sglang.srt.layers.moe.paged_experts.formats import GptqMarlinFormat
+
+        with self.assertRaisesRegex(RuntimeError, "BF16/FP16 and block-FP8 only"):
+            self._check(xpu=True, expert_format=GptqMarlinFormat())
 
     def test_rejects_speculative_decoding(self):
         with self.assertRaisesRegex(RuntimeError, "speculative decoding"):

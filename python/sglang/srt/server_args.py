@@ -332,6 +332,7 @@ class ServerArgs:
         return resolved
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "Qwen3_5MoeForConditionalGeneration",
         "DeepseekV4ForCausalLM",
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",

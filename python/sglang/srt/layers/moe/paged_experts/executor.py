@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.paged_experts.residency import (
 )
 from sglang.srt.layers.moe.paged_experts.runners import RunnerContract, run_on_slots
 from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+from sglang.srt.utils import is_device_stream_capturing
 
 
 class EagerExecutor:
@@ -45,7 +46,7 @@ class EagerExecutor:
 
     def run(self, layer, dispatch_output):
         if self.device_residency is not None:
-            if torch.cuda.is_current_stream_capturing():
+            if is_device_stream_capturing(self.device_residency.step.device):
                 raise RuntimeError(
                     "Paged experts: a captured decode batch routes more entries than the K "
                     "resident slots; capture batch sizes must stay at or below K // top_k"

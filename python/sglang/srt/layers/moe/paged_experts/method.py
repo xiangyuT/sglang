@@ -7,10 +7,17 @@ import logging
 import torch
 
 from sglang.srt.layers.moe.paged_experts.executor import DeviceExecutor, EagerExecutor
-from sglang.srt.layers.moe.paged_experts.formats import ExpertFormat, format_for
+from sglang.srt.layers.moe.paged_experts.formats import (
+    ExpertFormat,
+    Fp8BlockFormat,
+    UnquantizedFormat,
+    format_for,
+)
 from sglang.srt.layers.moe.paged_experts.residency import DeviceResidency, LRUPolicy
+from sglang.srt.layers.moe.paged_experts.runners import XPU
 from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -28,6 +35,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_platform,
     get_spec,
     process_model_config,
 )
@@ -140,20 +148,30 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             num_slots=self.num_resident,
         )
         residency = None
-        if self.graphs:
+        device = getattr(layer, self.format.paged_params[0]).device
+        xpu_device_path = device.type == "xpu" and isinstance(
+            self.format, Fp8BlockFormat
+        )
+        if self.graphs or xpu_device_path:
             residency = DeviceResidency(
                 num_experts=self.num_experts,
                 num_slots=self.num_resident,
                 device=getattr(layer, self.format.paged_params[0]).device,
             )
-            self.store.bind_device_gather(layer)
-            self.device_executor = DeviceExecutor(
+            executor_args = dict(
                 base_method=self.base_method,
                 store=self.store,
                 residency=residency,
                 contract=self.format.contract,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
+            if xpu_device_path:
+                from sglang.srt.layers.moe.paged_experts.xpu import XpuDeviceExecutor
+
+                self.device_executor = XpuDeviceExecutor(layer=layer, **executor_args)
+            else:
+                self.store.bind_device_gather(layer)
+                self.device_executor = DeviceExecutor(**executor_args)
         self.executor = EagerExecutor(
             base_method=self.base_method,
             store=self.store,
@@ -226,6 +244,8 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
 def make_for_layer(layer, base_method) -> PagedExpertsMoEMethod:
     expert_format = format_for(base_method)
     check_paged_experts_compat(layer=layer, expert_format=expert_format)
+    if get_platform().is_xpu and not get_moe_runner_backend().is_triton():
+        expert_format.contract = XPU
     num_experts = layer.num_local_experts
     num_resident = min(get_exec().moe.paged_experts_num_resident, num_experts)
     if check_cuda_graph_backend(Phase.DECODE, Backend.FULL):
@@ -264,6 +284,18 @@ def check_paged_experts_compat(layer, expert_format) -> None:
     ``expert_format`` is None when no format handles the layer's quantization method."""
 
     problems = []
+    if get_platform().is_xpu:
+        if not check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
+            problems.append("XPU paged experts prefill graphs must be disabled")
+        if not cuda_graph_fully_disabled():
+            if not isinstance(expert_format, Fp8BlockFormat):
+                problems.append("XPU paged decode graphs require block-FP8 experts")
+            if get_moe_runner_backend().is_triton():
+                problems.append("XPU paged decode graphs require the native MoE runner")
+        if expert_format is not None and not isinstance(
+            expert_format, (UnquantizedFormat, Fp8BlockFormat)
+        ):
+            problems.append("XPU paged experts supports BF16/FP16 and block-FP8 only")
     parallel = get_parallel()
     for name in ("tp_size", "ep_size", "pp_size", "dp_size"):
         if getattr(parallel, name) > 1:

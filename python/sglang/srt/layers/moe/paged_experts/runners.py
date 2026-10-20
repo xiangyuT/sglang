@@ -142,5 +142,40 @@ class MarlinContract(RunnerContract):
         moe_sum_reduce(entries, out, routed_scaling_factor)
 
 
+class XpuContract(MarlinContract):
+    """Native XPU kernels return a combined [tokens, hidden] tensor.
+
+    A single wave uses the native combined output directly. Multiple waves run
+    each routed entry as a top-k=1 row, then merge in the original top-k order.
+    This avoids depending on a no-combine ABI in sgl-kernel-xpu.
+    """
+
+    def runner_config(self, moe_runner_config, num_slots: int):
+        return replace(
+            moe_runner_config,
+            num_local_experts=num_slots,
+            inplace=False,
+            no_combine=False,
+            no_combine_keep_router_weight=False,
+            # finish() applies the layer's scale once after the top-k sum.
+            routed_scaling_factor=1.0,
+        )
+
+    def finish(self, merged, hidden_states, routed_scaling_factor: float):
+        if merged is None:
+            return torch.zeros_like(hidden_states)
+        if merged.dim() == 2:
+            return (
+                merged
+                if routed_scaling_factor == 1.0
+                else merged * routed_scaling_factor
+            )
+        return super().finish(merged, hidden_states, routed_scaling_factor)
+
+    def _sum_top_k(self, entries, out, routed_scaling_factor: float) -> None:
+        TritonContract._sum_top_k(self, entries, out, routed_scaling_factor)
+
+
 TRITON = TritonContract()
 MARLIN = MarlinContract()
+XPU = XpuContract()

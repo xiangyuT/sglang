@@ -967,7 +967,9 @@ class ExecMoe(msgspec.Struct):
         "Keep only --paged-experts-num-resident routed experts per MoE layer on the GPU and page "
         "the rest from pinned host memory on demand. Unquantized, block-FP8 or GPTQ experts, "
         "single GPU. Decode CUDA graphs (full backend) are captured up to K // top_k requests; "
-        "prefill graphs must be breakable or disabled.",
+        "prefill graphs must be breakable or disabled. Native XPU supports unquantized "
+        "eager experts and block-FP8 eager/full-decode graphs; XPU prefill graphs "
+        "must be disabled.",
     ] = False
     paged_experts_num_resident: A[
         Optional[int],

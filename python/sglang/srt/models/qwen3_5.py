@@ -2741,6 +2741,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
+            if self.language_model_only and "visual" in name:
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
