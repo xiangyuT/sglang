@@ -1094,6 +1094,9 @@ class Envs:
     # quantization; unsupported devices/shapes keep scaled_mm. Set to 0 for
     # native accumulation ordering (greedy tokens can differ at near ties).
     SGLANG_XPU_M1_BLOCK_FP8_GEMV = EnvBool(True)
+    # Single-token top-8 W8A16 experts for the supported B70 layout. Set to 0
+    # to retain native grouped GEMM; prefill and other layouts stay native.
+    SGLANG_XPU_M1_FP8_EXPERT_GEMV = EnvBool(True)
     # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
     # Disable to save the additional weight memory or allow online updates.
     SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
