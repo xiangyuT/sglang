@@ -1090,6 +1090,10 @@ class Envs:
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # B70 single-token block-FP8 projections. Retains W8A8 activation
+    # quantization; unsupported devices/shapes keep scaled_mm. Set to 0 for
+    # native accumulation ordering (greedy tokens can differ at near ties).
+    SGLANG_XPU_M1_BLOCK_FP8_GEMV = EnvBool(True)
     # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
     # Disable to save the additional weight memory or allow online updates.
     SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)

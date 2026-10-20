@@ -777,6 +777,34 @@ def torch_w8a8_block_fp8_linear(
         q_input = q_input.contiguous()
     if weight.stride(-1) != 1:
         weight = weight.contiguous()
+    if (
+        envs.SGLANG_XPU_M1_BLOCK_FP8_GEMV.get()
+        and q_input.device.type == "xpu"
+        and q_input.shape[0] == 1
+        and q_input.dtype == weight.dtype == torch.float8_e4m3fn
+        and (input_scale is not None or input.dtype == torch.bfloat16)
+        and q_input.shape[1] == weight.shape[1]
+        and weight.is_contiguous()
+        and activation_scale.stride(-1) == 1
+        and activation_scale.dtype == weight_scale.dtype == torch.float32
+        and weight_scale.shape == (weight.shape[0] // 128, weight.shape[1] // 128)
+        and q_input.device
+        == weight.device
+        == activation_scale.device
+        == weight_scale.device
+        and block_n == 128
+        and bias is None
+        and (weight.shape[0], weight.shape[1])
+        in {(12288, 2048), (9216, 2048), (2048, 4096), (1024, 2048), (2048, 512)}
+        # The internal dequantization rounding was verified on B70. Other XPU
+        # generations keep their own native implementation.
+        and torch.xpu.get_device_properties(q_input.device).device_id == 0xE223
+    ):
+        from sglang.kernels.ops.gemm.xpu_block_fp8_gemv import xpu_block_fp8_gemv
+
+        return xpu_block_fp8_gemv(q_input, weight, activation_scale, weight_scale).view(
+            *input.shape[:-1], weight.shape[0]
+        )
     weight_t = weight.t()
     scale_b = weight_scale if block_n == 1 else weight_scale.t()
     output = torch.nn.functional.scaled_mm(
