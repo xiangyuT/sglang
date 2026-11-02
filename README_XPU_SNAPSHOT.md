@@ -145,4 +145,3 @@ GGML-derived decoding tables retain the GGML MIT notices. Other vendored code
 retains the adjacent license files; the repository's Apache-2.0 license remains
 unchanged. See the corresponding native source directories for the original
 copyright and license text.
-

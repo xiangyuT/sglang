@@ -1,0 +1,12 @@
+{
+  "sgl_kernel_xpu_repository": "https://github.com/sgl-project/sgl-kernel-xpu",
+  "sgl_kernel_xpu_revision": "028ac5a4e92a4addabeedac1a94374515f68e4a5",
+  "sgl_kernel_xpu_package_version": "0.4.0",
+  "sycl_tla_repository": "https://github.com/intel/sycl-tla",
+  "sycl_tla_revision": "7b56b936b87f799f80dde60c2fd8d11c1128cebb",
+  "header": "src/sycl/kernels/gdn_attn/chunk_gated_delta_rule_kernels.hpp",
+  "original_header_sha256": "daa1bc223fcee67d1578ed665bdb727282aae3adb8b78bc5e9cdbf8687996977",
+  "patched_header_sha256": "fa2b9aca9eeb21e6b93ccf7e8feca5a73794f81625c066e5ce651e0f398edad1",
+  "bridge_sha256": "4de1b518e2893f4b7b42c62e76ba61459e0ca972b1f6475d86bbc553f39822cf",
+  "scope": "Existing process-local BF16 activation / FP32-state native GDN prefill compatibility shim. Does not replace the installed package; no binary or model artifacts included."
+}

@@ -1,0 +1,13 @@
+--- a/src/sycl/kernels/gdn_attn/chunk_gated_delta_rule_kernels.hpp
++++ b/src/sycl/kernels/gdn_attn/chunk_gated_delta_rule_kernels.hpp
+@@ -408 +408 @@
+-      item.barrier(sycl::access::fence_space::local_space);
++      item.barrier(sycl::access::fence_space::global_and_local);
+@@ -423 +423 @@
+-      item.barrier(sycl::access::fence_space::local_space);
++      item.barrier(sycl::access::fence_space::global_and_local);
+@@ -486,0 +487 @@
++      item.barrier(sycl::access::fence_space::global_and_local);
+@@ -549 +550 @@
+-          item.barrier(sycl::access::fence_space::local_space);
++          item.barrier(sycl::access::fence_space::global_and_local);
