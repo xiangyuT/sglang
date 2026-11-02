@@ -2,7 +2,6 @@ from typing import Optional, Tuple, Union
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
@@ -629,6 +628,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
         metadata = self.forward_metadata
         mamba_pool = self.req_to_token_pool.mamba_pool
         mamba_cache = mamba_pool.mamba_cache
+        if getattr(mamba_cache, "gguf_gdn_sycl", None) is not None:
+            if (
+                forward_batch.spec_info.draft_token_num != 4
+                or metadata.retrieve_parent_token is not None
+                or pp_spec_stable_rows_enabled()
+            ):
+                raise ValueError("GGUF SYCL GDN requires one fixed four-row linear verify window")
+            self._use_strided_target_verify_qkv = True
+            return
+        if getattr(mamba_cache, "dflash_sycl", None) is not None:
+            if (
+                forward_batch.spec_info.draft_token_num not in (4, 8)
+                or forward_batch.spec_info.draft_token_num
+                != mamba_cache.dflash_sycl.steps
+                or metadata.retrieve_parent_token is not None
+                or pp_spec_stable_rows_enabled()
+            ):
+                raise ValueError(
+                    "SYCL GDN only supports one matching M4/M8 linear verify window"
+                )
+            self._use_strided_target_verify_qkv = True
+            return
         is_gdn_replayssm = not getattr(mamba_pool, "replayssm_is_kda", False)
         use_replayssm_fold = (
             mamba_cache.replayssm_rawv is not None
@@ -961,6 +982,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
+        # Match the native B70 decode arithmetic during block verification.
+        # Other devices/backends retain their existing convolution and gating.
+        native_bf16_gdn = (
+            is_target_verify
+            and is_xpu()
+            and self.linear_attn_backends.decode.is_intel_xpu()
+            and mixed_qkv.dtype == torch.bfloat16
+            and layer.dt_bias.dtype == torch.bfloat16
+            and torch.xpu.get_device_properties(mixed_qkv.device).device_id == 0xE223
+        )
         forward_metadata = self.forward_metadata
 
         query_start_loc = forward_metadata.query_start_loc
@@ -990,12 +1021,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            intermediate_state_indices = select_verify_intermediate_state_indices(
-                self.verify_intermediate_state_indices,
-                forward_batch.req_pool_indices,
-                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-                self.req_to_token_pool.size,
-            )
+            if (
+                mamba_cache_params.gguf_gdn_sycl is not None
+                and not pp_spec_stable_rows_enabled()
+            ):
+                # The non-stable helper returns this table unchanged. Avoid
+                # producing its otherwise unused validity mask on every layer.
+                intermediate_state_indices = self.verify_intermediate_state_indices
+            else:
+                intermediate_state_indices = select_verify_intermediate_state_indices(
+                    self.verify_intermediate_state_indices,
+                    forward_batch.req_pool_indices,
+                    cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                    self.req_to_token_pool.size,
+                )
             mamba_pool = self.req_to_token_pool.mamba_pool
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None
@@ -1056,6 +1095,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
+                **({"fp32_products": True} if native_bf16_gdn else {}),
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
@@ -1105,7 +1145,38 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
             # verify, fold on commit), circular ring, or the snapshotting
             # fallback when neither ring is allocated.
-            if use_replayssm_fold:
+            if mamba_cache_params.gguf_gdn_sycl is not None:
+                from sglang.kernels.ops.attention.gguf_gdn_sycl import verify_gdn
+
+                core_attn_out = verify_gdn(
+                    mamba_cache_params, q=query, k=key, v=value, a=a, b=b,
+                    A_log=layer.A_log, dt_bias=layer.dt_bias, indices=cache_indices,
+                    cu_seqlens=query_start_loc,
+                    steps=forward_batch.spec_info.draft_token_num,
+                    native_bf16_gdn=native_bf16_gdn,
+                    retrieve_parent_token=retrieve_parent_token,
+                    stable_rows=pp_spec_stable_rows_enabled(),
+                )
+            elif mamba_cache_params.dflash_sycl is not None:
+                from sglang.kernels.ops.attention.dflash_gdn_sycl import verify_gdn
+
+                core_attn_out = verify_gdn(
+                    mamba_cache_params,
+                    q=query,
+                    k=key,
+                    v=value,
+                    a=a,
+                    b=b,
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    indices=cache_indices,
+                    cu_seqlens=query_start_loc,
+                    steps=forward_batch.spec_info.draft_token_num,
+                    native_bf16_gdn=native_bf16_gdn,
+                    retrieve_parent_token=retrieve_parent_token,
+                    stable_rows=pp_spec_stable_rows_enabled(),
+                )
+            elif use_replayssm_fold:
                 core_attn_out = self._replayssm_fold_target_verify(
                     layer=layer,
                     query=query,
@@ -1160,6 +1231,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_steps=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
                     stable_rows=pp_spec_stable_rows_enabled(),
+                    **({"native_bf16_gdn": True} if native_bf16_gdn else {}),
                 )
         else:
             g, beta = self._prefill_gates(layer, a, b)

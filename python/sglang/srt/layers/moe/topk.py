@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import (
@@ -46,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_server_args,
+    get_spec,
 )
 
 try:
@@ -934,6 +936,7 @@ def fused_topk_torch_native(
     correction_bias: torch.Tensor = None,
     scoring_func: str = "softmax",
 ):
+    normalized_in_kernel = False
     def scoring_func_impl(gating_output: torch.Tensor) -> torch.Tensor:
         if scoring_func == "softmax":
             return gating_output.softmax(dim=-1)
@@ -962,9 +965,27 @@ def fused_topk_torch_native(
         )
         topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
         topk_weights = scoring_func_impl(gating_output.float())
-        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+        if (
+            os.environ.get("SGLANG_XPU_GGUF_TOPK") == "1"
+            and scoring_func == "softmax"
+            and topk == 10
+        ):
+            from sglang.kernels.ops.moe import gguf_topk
 
-    if renormalize:
+            if gguf_topk.supports(topk_weights):
+                normalized_in_kernel = (
+                    renormalize
+                    and os.environ.get("SGLANG_XPU_GGUF_TOPK_NORM") == "1"
+                )
+                topk_weights, topk_ids = gguf_topk.select(
+                    topk_weights, normalize=normalized_in_kernel,
+                )
+            else:
+                topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+        else:
+            topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+
+    if renormalize and not normalized_in_kernel:
         # fp32 like the reference gate (the epsilon is not representable in
         # fp16); the sum dtype and the division's type promotion upcast inside
         # the existing kernels, so no extra cast launch is needed
@@ -1137,12 +1158,35 @@ def fused_topk(
                 renormalize=renormalize,
             )
         else:
-            topk_softmax(
-                topk_weights,
-                topk_ids,
-                gating_output,
-                renormalize,
-            )
+            use_ar_topk = False
+            if (
+                _is_xpu
+                and envs.SGLANG_XPU_AR_TOPK_SYCL.get()
+                and not torch.compiler.is_compiling()
+                and correction_bias is None
+                and num_fused_shared_experts == 0
+                and num_token_non_padded is None
+                and get_spec().speculative_algorithm is None
+                and get_exec().moe.enable_paged_experts
+                and get_exec().moe.paged_experts_num_resident == 192
+            ):
+                from sglang.kernels.ops.moe.xpu_ar_topk_sycl import (
+                    can_use_ar_topk,
+                    xpu_ar_topk,
+                )
+
+                use_ar_topk = can_use_ar_topk(
+                    gating_output, topk_weights, topk_ids, renormalize
+                )
+            if use_ar_topk:
+                xpu_ar_topk(gating_output, topk_weights, topk_ids, renormalize)
+            else:
+                topk_softmax(
+                    topk_weights,
+                    topk_ids,
+                    gating_output,
+                    renormalize,
+                )
     elif scoring_func == "sigmoid":
         if _use_aiter and correction_bias is not None:
             aiter_biased_grouped_topk(

@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.quantization.gguf_mtp_prefill import mtp_prefill_tail
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -16,6 +17,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
 from sglang.srt.runtime_context import get_model, get_parallel
@@ -197,7 +199,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        with self._npu_quant_context():
+        with self._npu_quant_context(), set_forward_batch(forward_batch):
             input_embeds = self._prepare_input_embeds(
                 input_ids, forward_batch, input_embeds
             )
@@ -205,7 +207,8 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             if not forward_batch.forward_mode.is_idle():
                 hidden_states = self._mtp_input_fusion(input_embeds, hidden_states)
 
-            with get_global_expert_distribution_recorder().disable_this_region():
+            with (get_global_expert_distribution_recorder().disable_this_region(),
+                  mtp_prefill_tail(self, forward_batch)):
                 model_output = self.model(
                     input_ids,
                     positions,

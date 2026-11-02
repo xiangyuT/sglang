@@ -199,6 +199,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_GDC: tl.constexpr = False,
     MATCH_CUTEDSL_DECODE: tl.constexpr = False,
     ROUND_STATE_TO_BF16: tl.constexpr = False,
+    ROUND_GDN_GATE_TO_BF16: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -329,6 +330,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
         x = b_a + b_dt_bias
+        if ROUND_GDN_GATE_TO_BF16 and not IS_KDA:
+            # Match B70 native GDN decode's BF16 addition before softplus.
+            x = x.to(tl.bfloat16).to(tl.float32)
         if USE_LOWER_BOUND:
             # KDA safe gate: lower_bound * sigmoid(exp(A_log) * (a + dt_bias))
             b_g = lower_bound * tl.sigmoid(tl.exp(b_A_log) * x)

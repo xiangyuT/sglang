@@ -243,6 +243,7 @@ def _layer_norm_fwd(
     is_rms_norm=False,
     activation: str = "swish",
     quant_heads: int = 0,
+    rows_per_block: int | None = None,
 ):
     M, N = x.shape
     if group_size is None:
@@ -282,8 +283,12 @@ def _layer_norm_fwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
-    # Calculate rows per block based on SM count
-    rows_per_block = calc_rows_per_block(M, x.device)
+    # A caller can retain its one-token reduction layout across decode batches.
+    # Changing this tile can change the final BF16 bit on recurrent model inputs.
+    if rows_per_block is None:
+        rows_per_block = calc_rows_per_block(M, x.device)
+    elif rows_per_block not in (1, 2, 4):
+        raise ValueError("rows_per_block must be 1, 2 or 4")
     quant = {}
     # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
     if quant_heads:

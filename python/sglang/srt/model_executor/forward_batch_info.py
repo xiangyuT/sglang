@@ -1205,7 +1205,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
-                ret.positions = clamp_position(batch.seq_lens)
+                from sglang.srt.mem_cache.ar231_prepare import prepared_positions
+                ret.positions = prepared_positions(batch)
+                if ret.positions is None:
+                    ret.positions = clamp_position(batch.seq_lens)
         else:
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.

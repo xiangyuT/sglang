@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     get_model_loader,
@@ -52,6 +53,14 @@ def _unsupported_derived_weight_cache_error(
     including references retained by captured CUDA graphs. These constraints
     must be startup-determined and rank-uniform so all workers reject together.
     """
+    # Check the startup flag even before the first head warmup. Captured graphs
+    # cannot observe invalidation performed only by a later Python forward.
+    if envs.SGLANG_XPU_AR_STATIC_PACKED_HEAD_SYCL.get():
+        return (
+            "Online weight updates are not supported while the static packed "
+            "XPU head is enabled. Restart with "
+            "SGLANG_XPU_AR_STATIC_PACKED_HEAD_SYCL=0 to update weights."
+        )
     if model is not None and any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None
@@ -307,7 +316,13 @@ class WeightUpdater:
         )
         return bucket.reconstruct_tensors()
 
+    def derived_weight_cache_error(self: WeightUpdater) -> Optional[str]:
+        return _unsupported_derived_weight_cache_error(self.get_model())
+
     def begin_weight_update(self: WeightUpdater) -> None:
+        error = self.derived_weight_cache_error()
+        if error is not None:
+            raise RuntimeError(error)
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )

@@ -1094,6 +1094,155 @@ class Envs:
     # quantization; unsupported devices/shapes keep scaled_mm. Set to 0 for
     # native accumulation ordering (greedy tokens can differ at near ties).
     SGLANG_XPU_M1_BLOCK_FP8_GEMV = EnvBool(True)
+    # Experimental B70 TP2/TP4 decode projections; preserves FP8 quantization
+    # and BF16 output with a different FP32 accumulation tree.
+    SGLANG_XPU_TP_BLOCK_FP8_SYCL = EnvBool(False)
+    SGLANG_XPU_TP_BLOCK_FP8_SYCL_LIB = EnvStr("")
+    # Reuse the validated H2048 norm/block-FP8 producer after TP collectives.
+    SGLANG_XPU_TP_NORM_QUANT = EnvBool(False)
+    SGLANG_XPU_TP_QK_ROPE_SYCL = EnvBool(False)
+    SGLANG_XPU_TP_QK_ROPE_SYCL_LIB = EnvStr("")
+    SGLANG_XPU_TP_GDN_NORM_QUANT_SYCL = EnvBool(False)
+    SGLANG_XPU_TP_GDN_NORM_QUANT_SYCL_LIB = EnvStr("")
+    SGLANG_XPU_TP_AUX_FP8_SYCL = EnvBool(False)
+    SGLANG_XPU_TP_AUX_FP8_SYCL_LIB = EnvStr("")
+    SGLANG_XPU_TP_EXPERT_DOWN_SYCL = EnvBool(False)
+    SGLANG_XPU_TP_EXPERT_DOWN_SYCL_LIB = EnvStr("")
+    SGLANG_XPU_TP_CPU_EXPERT_METADATA = EnvBool(False)
+    SGLANG_XPU_PEER_ALLREDUCE = EnvBool(False)
+    SGLANG_XPU_PEER_ALLREDUCE_LIB = EnvStr("")
+    SGLANG_XPU_TP_BOUNDED_HEAD = EnvBool(False)
+    SGLANG_XPU_TP_BOUNDED_HEAD_LIB = EnvStr("")
+    # Plain-greedy TP2 head: graphable threshold and winner sidebands over
+    # the existing BF16 peer AR. Requires the bounded/static-head guards.
+    SGLANG_XPU_TP_HEAD_GRAPH_COLLECTIVES = EnvBool(False)
+    SGLANG_XPU_TP_HEAD_GRAPH_COLLECTIVES_LIB = EnvStr("")
+    SGLANG_XPU_TP_EXPERT_GU_SYCL = EnvBool(False)
+    SGLANG_XPU_TP_EXPERT_GU_SYCL_LIB = EnvStr("")
+    # Native reference for standard no-A2A EP with nonlocal route IDs (-1).
+    SGLANG_XPU_EP_SAFE_ROUTES = EnvBool(False)
+    # B70 TP2/EP2, no A2A, trivial 256+128 physical expert layout. Choose one
+    # replica per route identically on both ranks, balancing each token's top8.
+    SGLANG_XPU_EP_REPLICA_BALANCE = EnvBool(False)
+    # Defer single-token replica mapping to the GU kernel, removing one graph
+    # node per MoE layer. Requires the replica GU ABI and the balance flag.
+    SGLANG_XPU_EP_REPLICA_FUSED_GU = EnvBool(False)
+    # Eight-warp long-K reduction on B70. Set to 0 for the previous four-warp
+    # reduction order when diagnosing greedy differences at rounding boundaries.
+    SGLANG_XPU_M1_BLOCK_FP8_LONG_K_WARP8 = EnvBool(True)
+    # B70 BF16 single-token GDN Conv1D + recurrent update. Other layouts keep
+    # the native op; set to 0 to compare its original kernel ordering.
+    SGLANG_XPU_GDN_DECODE = EnvBool(True)
+    # Native GDN decode reads this constant flag. Initialize it outside capture
+    # and reuse it across layers instead of capturing a fill in every layer.
+    SGLANG_XPU_GDN_INITIAL_STATE_CACHE = EnvBool(False)
+    # Experimental ordinary-AR K192 prefill cache ages. Uses current prompt
+    # routes only; weights, wave count and the decode LRU kernel are retained.
+    SGLANG_XPU_AR_PREFILL_PRIORITY = EnvBool(False)
+    # Experimental B70 ordinary-AR M1 paged attention. Zero keeps native
+    # heuristics; split-KV changes BF16 rounding. Restart and recapture.
+    SGLANG_XPU_AR_DECODE_SPLITS = EnvInt(0)
+    # B70 AR K192 single-row BF16 router. Build with the matching manual
+    # script; correctly rounded FP32 divisions are part of the contract.
+    # Restart and recapture after changing this flag or library.
+    SGLANG_XPU_AR_TOPK_SYCL = EnvBool(False)
+    SGLANG_XPU_AR_TOPK_SYCL_LIB = EnvStr("")
+    # Exact FP8/256 decode with compensated FP16-rounded scales, GRF256.
+    # B70 AR K192 long-K warp8 only; restart and recapture after changing.
+    SGLANG_XPU_AR_LONG_K_SCALED_FP8 = EnvBool(False)
+    # B70 AR K192 gate/up only; native down retained. Build the manual SYCL
+    # library, restart and recapture when changing this flag or library.
+    SGLANG_XPU_AR_EXPERT_GATE_SYCL = EnvBool(False)
+    SGLANG_XPU_AR_EXPERT_GATE_SYCL_LIB = EnvStr("")
+    # B70 pure-AR shared gate/up and down GEMV. Build the matching manual
+    # library, restart and recapture after changing the flag or library.
+    SGLANG_XPU_AR_SMALL_DENSE_SYCL = EnvBool(False)
+    SGLANG_XPU_AR_SMALL_DENSE_SYCL_LIB = EnvStr("")
+    # Experimental B70 BF16 head compression for static-weight ordinary AR.
+    # Lossless weight encoding; FP32 reduction may round logits differently.
+    # Adds a derived GPU cache and rejects online weight updates. Restart and
+    # recapture after changing this flag, the library, or checkpoint weights.
+    SGLANG_XPU_AR_STATIC_PACKED_HEAD_SYCL = EnvBool(False)
+    SGLANG_XPU_AR_STATIC_PACKED_HEAD_SYCL_LIB = EnvStr("")
+    # Experimental combination: block verification must fit one expert wave.
+    SGLANG_XPU_PAGED_DFLASH = EnvBool(False)
+    # Deterministic BF16 selector top-16 for the experimental B70 DFLASH path.
+    SGLANG_XPU_DFLASH_TOPK = EnvBool(True)
+    # Single-request BF16 bidirectional draft block; model window 2048, left 2047.
+    SGLANG_XPU_DFLASH_ATTENTION = EnvBool(True)
+    # Optional M4 SYCL-TLA decode adapter; parent/master required, recapture.
+    SGLANG_XPU_DFLASH_ATTENTION_TLA = EnvBool(False)
+    SGLANG_XPU_DFLASH_ATTENTION_TLA_LIB = EnvStr("")
+    SGLANG_XPU_DFLASH_ATTENTION_PAGED_TLA = EnvBool(False)
+    SGLANG_XPU_DFLASH_ATTENTION_PAGED_TLA_LIB = EnvStr("")
+    # Reframe the supported single-request causal target block as independent
+    # native decode queries, each with its own visible KV length.
+    # Keep opt-in: native decode changes prefill rounding and draft acceptance.
+    SGLANG_XPU_DFLASH_VERIFY_DECODE = EnvBool(False)
+    # Original native prefill math with Q16/KV64/SG2 instead of Q256/KV64/SG32.
+    SGLANG_XPU_DFLASH_NATIVE_PREFILL = EnvBool(False)
+    # Optional external SYCL scheduling library; build and select explicitly.
+    SGLANG_XPU_DFLASH_COMPACT_MOE = EnvBool(False)
+    # Read missing weights from pinned USM while native DPAS fills the cache.
+    # Requires the compact MoE child and an explicitly built native library.
+    SGLANG_XPU_DFLASH_PAGED_MOE = EnvBool(False)
+    # Fuse M=4 route metadata and scale copies on the native paged MoE path.
+    # Requires the DFlash master; restart and recapture after changing flags.
+    SGLANG_XPU_DFLASH_FUSED_ROUTES = EnvBool(False)
+    # Pure SYCL M=4 route metadata and scale copies; requires the DFlash
+    # master, native paged MoE and a library exporting dflash_routes_abi.
+    SGLANG_XPU_DFLASH_SYCL_ROUTES = EnvBool(False)
+    # Single-wave E256/K192/R32 integer LRU in the explicit native library.
+    # Requires the DFlash master; other shapes retain the existing planner.
+    SGLANG_XPU_DFLASH_SYCL_PLANNER = EnvBool(False)
+    # Single-request M=4 draft verify metadata, preserving the live KV source.
+    SGLANG_XPU_DFLASH_SYCL_METADATA = EnvBool(False)
+    # Device-prefix BF16 KV writes avoid dynamic nonzero on the draft path.
+    SGLANG_XPU_DFLASH_PREFIX_KV = EnvBool(False)
+    SGLANG_XPU_DFLASH_NATIVE_LIB = EnvStr("")
+    # Small-M shared projection; requires the experimental DFlash master.
+    SGLANG_XPU_DFLASH_SHARED_GEMV = EnvBool(False)
+    # M=4 dense DPAS preserves the tested native FP16 operand rounding.
+    SGLANG_XPU_DFLASH_DENSE_DPAS = EnvBool(False)
+    # Sequential-K native M=4 dense; requires DENSE_DPAS and the master.
+    # Warm immutable packed weights before capture; restart after changes.
+    SGLANG_XPU_DFLASH_DENSE_SYCL = EnvBool(False)
+    # Direct FP8 SYCL ESIMD for M=4, N2048/K512; parent/master required.
+    # Live weights/scales, FP16 operands, FP32 vector reduction; recapture.
+    SGLANG_XPU_DFLASH_SMALL_DENSE_SYCL = EnvBool(False)
+    # Static FP16 small-weight cache + separate SYCL quant and sycl-tla DPAS.
+    # B70/raw-BF16 M4 only; master/DENSE_DPAS required; restart after changes.
+    SGLANG_XPU_DFLASH_SMALL_TLA = EnvBool(False)
+    SGLANG_XPU_DFLASH_SMALL_TLA_LIB = EnvStr("")
+    # Independent B70 raw-BF16 block128 quantizer; requires DFlash master.
+    # Reuses SMALL_TLA_LIB without enabling its projection or weight cache.
+    SGLANG_XPU_DFLASH_QUANT_SYCL = EnvBool(False)
+    # M8 target verify: gated norm + block128 quant, master/QUANT_SYCL required.
+    SGLANG_XPU_DFLASH_GDN_NORM_QUANT_SYCL = EnvBool(False)
+    SGLANG_XPU_DFLASH_GDN_NORM_QUANT_LIB = EnvStr("")
+    # Experimental M4/N2048/K4096 FP16-operand SYCL split-K projection.
+    SGLANG_XPU_DFLASH_LONG_DENSE_SYCL = EnvBool(False)
+    # Narrow the existing recurrent verify tile for B70 M=4 FP32 checkpoints.
+    # No new Triton kernel; restart and recapture after changing this child.
+    SGLANG_XPU_DFLASH_GDN_NARROW = EnvBool(False)
+    # M4/B1/TP1/PP1, radix off: pool-owned exact SYCL delta verify/commit.
+    # Independent precise library; restart and recapture after changing it.
+    SGLANG_XPU_DFLASH_GDN_SYCL = EnvBool(False)
+    SGLANG_XPU_DFLASH_GDN_LIB = EnvStr("")
+    # Five contiguous INT64 M4 graph inputs, using the same auxiliary library.
+    # Independent of GDN_SYCL; requires the master, defaults to disabled.
+    SGLANG_XPU_DFLASH_SMALL_COPY_SYCL = EnvBool(False)
+    # Private FP8 copy for draft proposals; target parameters remain BF16.
+    # Initialize before graph capture; restart after flag or weight changes.
+    SGLANG_XPU_DFLASH_FP8_DRAFT_HEAD = EnvBool(False)
+    # 64: rerank an FP8 top-64 shortlist with the original BF16 head. 0: direct.
+    SGLANG_XPU_DFLASH_DRAFT_HEAD_RERANK = EnvInt(0)
+    # B70 M3/M7: one precise SYCL rescore/select kernel; prepare before capture.
+    SGLANG_XPU_DFLASH_DRAFT_RERANK_SYCL = EnvBool(False)
+    SGLANG_XPU_DFLASH_DRAFT_RERANK_LIB = EnvStr("")
+    # Conditional target top64 + SYCL BF16 completion on B70 M4/TP1 DFLASH.
+    # Experimental cast bound and changed FP32 reduction; master required.
+    SGLANG_XPU_DFLASH_TARGET_HEAD_SYCL = EnvBool(False)
     # Single-token top-8 W8A16 experts for the supported B70 layout. Set to 0
     # to retain native grouped GEMM; prefill and other layouts stay native.
     SGLANG_XPU_M1_FP8_EXPERT_GEMV = EnvBool(True)

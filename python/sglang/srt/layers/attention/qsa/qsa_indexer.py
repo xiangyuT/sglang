@@ -36,6 +36,17 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
 
 
+def _check_pending_ring_capacity(pool, ratio: int, rows: int, is_extend: bool,
+                                 max_rows_per_request=None) -> None:
+    ring_size = getattr(pool, "qsa_pending_ring_size", ratio)
+    # Before compression, a verify window may coexist with ratio-1 prefix
+    # keys. Each request owns an independent ring. Metadata supplies its
+    # bounded query window without reading the GPU request mapping back.
+    bound = rows if max_rows_per_request is None else max_rows_per_request
+    if not is_extend and ring_size > ratio and bound + ratio - 1 > ring_size:
+        raise ValueError("QSA verify window exceeds the causal pending-ring capacity")
+
+
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     if rows <= 0 or keys <= 0:
         return max(rows, 1)
@@ -274,6 +285,7 @@ class QSAIndexer(MultiPlatformOp):
             logical_positions=logical_positions,
             compress_ratio=self.compress_ratio,
             is_extend=is_extend,
+            ring_size=getattr(metadata.token_to_kv_pool, "qsa_pending_ring_size", self.compress_ratio),
         )
 
     def _group_ring_slots(
@@ -284,6 +296,7 @@ class QSAIndexer(MultiPlatformOp):
             group_end_positions=group_end_positions,
             sequence_ids=sequence_ids,
             compress_ratio=self.compress_ratio,
+            ring_size=getattr(metadata.token_to_kv_pool, "qsa_pending_ring_size", self.compress_ratio),
         )
 
     def update_key_state_and_compress(
@@ -299,6 +312,8 @@ class QSAIndexer(MultiPlatformOp):
 
         pool = metadata.token_to_kv_pool
         is_extend = metadata.compress_member_rows is not None
+        _check_pending_ring_capacity(pool, self.compress_ratio, token_k.shape[0], is_extend,
+                                     getattr(metadata, "max_query_rows_per_request", None))
         if not state_stored:
             if state_slots is None:
                 state_slots = self._pending_ring_slots(
@@ -409,6 +424,12 @@ class QSAIndexer(MultiPlatformOp):
         )
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
+        if tensor.device.type == "xpu":
+            from sglang.kernels.ops.attention.xpu_qsa_sycl import try_indexer_rope
+
+            native = try_indexer_rope(tensor, positions, self.rotary_emb)
+            if native is not None:
+                return native
         if not get_is_capture_mode() and hasattr(
             self.rotary_emb, "_ensure_cos_sin_cache_length"
         ):
@@ -527,10 +548,18 @@ class QSAIndexer(MultiPlatformOp):
                 row_starts=None,
             )
         else:
-            row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
-            block_indices = qsa_fast_topk(
-                logits, row_starts, compressed_lengths, topk=self.block_topk
-            )
+            block_indices = None
+            if logits.device.type == "xpu":
+                from sglang.kernels.ops.attention.xpu_qsa_sycl import try_decode_topk
+
+                block_indices = try_decode_topk(
+                    logits, compressed_lengths, self.block_topk
+                )
+            if block_indices is None:
+                row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
+                block_indices = qsa_fast_topk(
+                    logits, row_starts, compressed_lengths, topk=self.block_topk
+                )
         if defer_expansion:
             return block_indices
         return expand_qsa_block_indices(
@@ -689,6 +718,13 @@ class QSAIndexer(MultiPlatformOp):
             positions[:, :num_valid_tokens]
             if positions.ndim == 2
             else positions[:num_valid_tokens]
+        )
+        _check_pending_ring_capacity(
+            indexer_metadata.token_to_kv_pool,
+            self.compress_ratio,
+            num_valid_tokens,
+            indexer_metadata.compress_member_rows is not None,
+            getattr(indexer_metadata, "max_query_rows_per_request", None),
         )
         state_slots = indexer_metadata.pending_ring_slots
         if state_slots is None:

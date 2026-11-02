@@ -32,25 +32,53 @@ because the checkpoint author's own config outranks anything reconstructed.
 
 from typing import Any, Callable, Dict, Optional
 
+from sglang.srt.configs.muse_glimmer import MuseGlimmerConfig
 from transformers import PretrainedConfig
 
-from sglang.srt.configs.muse_glimmer import MuseGlimmerConfig
+
+def _build_qwen4_config(path: str) -> PretrainedConfig:
+    # model_loader imports ModelConfig, which in turn imports this module.
+    from sglang.srt.model_loader.qwen4_gguf import build_qwen4_gguf_config
+
+    return build_qwen4_gguf_config(path)
+
 
 GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
     "muse-glimmer": MuseGlimmerConfig.from_gguf,
+    "qwen4exp": _build_qwen4_config,
 }
+
+
+def _read_gguf_metadata(gguf_path: str) -> dict:
+    from gguf import GGUFReader
+    from sglang.srt.model_loader.gguf_native_reader import open_gguf_shards
+
+    # The native Qwen4 route accepts Q2_0 directly. Avoid constructing the
+    # standard reader's per-token arrays only to fail later on type 42.
+    try:
+        native = open_gguf_shards(gguf_path)[0].metadata
+        if native.get("general.architecture") == "qwen4exp":
+            return native
+    except (ValueError, EOFError, OSError):
+        pass
+
+    try:
+        reader = GGUFReader(gguf_path)
+        metadata = {key: field.contents() for key, field in reader.fields.items()}
+        if "general.architecture" in metadata or not metadata.get("split.no", 0):
+            return metadata
+    except ValueError:
+        pass
+
+    # Q2_0 is not in gguf-py's enum. A later PLE-only shard also lacks the
+    # architecture/tokenizer metadata. Resolve both through the primary header.
+    return open_gguf_shards(gguf_path)[0].metadata
 
 
 def read_gguf_architecture(gguf_path: str) -> Optional[str]:
     """The ``general.architecture`` string, or None if it cannot be read."""
     try:
-        from gguf import GGUFReader
-
-        reader = GGUFReader(gguf_path)
-        field = reader.fields.get("general.architecture")
-        if field is None:
-            return None
-        value = field.contents()
+        value = _read_gguf_metadata(gguf_path).get("general.architecture")
         return value if isinstance(value, str) else None
     except Exception:
         return None
@@ -74,6 +102,10 @@ _GPT4O_SPLIT_REGEX = (
 )
 
 _PRE_TOKENIZER_REGEX = {
+    "qwen35": (
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|"
+        r"\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+    ),
     # LLAMA_VOCAB_PRE_TYPE_LLAMA3
     "llama-bpe": (
         r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|"
@@ -96,11 +128,9 @@ def build_gguf_generation_config(gguf_path: str):
     an end-of-*message* id must not -- stopping on that truncates the model
     mid-reasoning, before it answers.
     """
-    from gguf import GGUFReader
     from transformers import GenerationConfig
 
-    reader = GGUFReader(gguf_path)
-    meta = {key: field.contents() for key, field in reader.fields.items()}
+    meta = _read_gguf_metadata(gguf_path)
 
     stop_ids = []
     for key in ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"):
@@ -133,12 +163,10 @@ def build_gguf_tokenizer(gguf_path: str, **kwargs: Any):
     """
     import json
 
-    from gguf import GGUFReader
     from tokenizers import Tokenizer
     from transformers import PreTrainedTokenizerFast
 
-    reader = GGUFReader(gguf_path)
-    meta = {key: field.contents() for key, field in reader.fields.items()}
+    meta = _read_gguf_metadata(gguf_path)
 
     tokens = list(meta["tokenizer.ggml.tokens"])
     token_types = [int(t) for t in meta["tokenizer.ggml.token_type"]]
@@ -155,7 +183,16 @@ def build_gguf_tokenizer(gguf_path: str, **kwargs: Any):
         i for i, t in enumerate(token_types) if t == _GGML_TOKEN_TYPE_CONTROL
     ]
     control = set(control_ids)
-    vocab = {tok: i for i, tok in enumerate(tokens) if i not in control}
+    if pre_name == "qwen35":
+        # These controls are inside the vocabulary, followed by padded rows.
+        # Removing them makes tokenizers assign new IDs at vocab_size instead
+        # of retaining the checkpoint's IDs. USER_DEFINED entries must also
+        # match as added tokens, while remaining visible during decoding.
+        vocab = {tok: i for i, tok in enumerate(tokens)}
+        added_ids = [i for i, t in enumerate(token_types) if t in (3, 4)]
+    else:
+        vocab = {tok: i for i, tok in enumerate(tokens) if i not in control}
+        added_ids = control_ids
 
     def token_of(key):
         idx = meta.get(f"tokenizer.ggml.{key}")
@@ -175,11 +212,11 @@ def build_gguf_tokenizer(gguf_path: str, **kwargs: Any):
                 "lstrip": False,
                 "rstrip": False,
                 "normalized": False,
-                "special": True,
+                "special": i in control,
             }
-            for i in control_ids
+            for i in added_ids
         ],
-        "normalizer": None,
+        "normalizer": {"type": "NFC"} if pre_name == "qwen35" else None,
         "pre_tokenizer": {
             "type": "Sequence",
             "pretokenizers": [

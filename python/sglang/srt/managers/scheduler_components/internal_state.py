@@ -60,6 +60,112 @@ class SchedulerInternalStateController:
         # A bound signal handler is not msgpack-serializable, and no reader
         # consumes it.
         state.pop("custom_sigquit_handler", None)
+        model = self.scheduler.tp_worker.model_runner.model
+        config = getattr(model.config, "text_config", model.config)
+        if getattr(config, "gguf_model_path", None):
+            # Native GGUF does not use the older FP8 paging experiments or
+            # their external fixture modules. Read only its live cache state.
+            from sglang.srt.layers.quantization.qwen4_gguf_xpu import (
+                CompressedGGUFMoEMethod,
+            )
+            from torch import are_deterministic_algorithms_enabled
+
+            methods = [
+                (module, module.quant_method)
+                for module in model.modules()
+                if isinstance(
+                    getattr(module, "quant_method", None), CompressedGGUFMoEMethod
+                )
+            ]
+            state["gguf_xpu_experts"] = {
+                "deterministic_torch": are_deterministic_algorithms_enabled(),
+                "layers": len(methods),
+                "slots_per_layer": [method.cache_slots for _, method in methods],
+                "compressed_cache_bytes": sum(
+                    method._gpu_cache.owned_resident_storage_bytes()
+                    if method._gpu_cache is not None
+                    else sum(
+                        getattr(module, "gguf_" + name).numel()
+                        for name in ("gate", "up", "down")
+                    )
+                    for module, method in methods
+                ),
+                "hits": sum(method.hits for _, method in methods),
+                "misses": sum(method.misses for _, method in methods),
+                "transferred_bytes": sum(
+                    method.transferred_bytes for _, method in methods
+                ),
+                "legacy_counters_scope": "host-planned fallback cache",
+                "gpu_cache_layers": [
+                    {
+                        "layer": index,
+                        "ep_rank": getattr(method, "ep_rank", 0),
+                        **method._gpu_cache.residency_snapshot(
+                            zero_expert=getattr(method, "real_experts", None)
+                        ),
+                    }
+                    for index, (_, method) in enumerate(methods)
+                    if method._gpu_cache is not None
+                ],
+            }
+            return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(state))
+        from sglang.srt.layers.moe.paged_experts.cpu40 import readback
+        state["codex_cpu67"] = readback()
+        import json, os
+        from pathlib import Path
+        from sglang.srt.layers import ar188_metadata as meta188
+        setting_root = os.environ.get('CODEX_AR_CPU40_ROOT')
+        setting_path = Path(setting_root) / 'metadata-mode.json' if setting_root else None
+        if meta188.enabled() and setting_path is not None and setting_path.exists():
+            setting=json.loads(setting_path.read_text())
+            assert set(setting)=={'mode'} and setting['mode'] in ['original','eager','ingraph']
+            meta188.switch_mode(setting['mode'])
+        state['codex_cpu67']['CPU_worker_count'] = 13 if state['codex_cpu67']['enabled'] else 0
+        state['codex_meta188']=meta188.readback()
+        from sglang.srt.mem_cache.ar231_prepare import readback as prepare_readback
+        state['codex_prepare231'] = prepare_readback()
+        pm = self.scheduler.profiler_manager
+        state["codex_cpu67"].update(torch_profiler_active=pm.torch_profiler is not None, profile_in_progress=pm.profile_in_progress, profiler_target_forward_ct=pm.profiler_target_forward_ct)
+        state["codex_cpu67"].update(
+            host_ready_d2h_worker=bool(getattr(self.scheduler, "codex_cpu74_host_d2h", False)),
+            async_d2h_enabled=self.scheduler.enable_async_d2h_copy,
+            d2h_worker_type=type(self.scheduler.async_d2h_worker).__name__,
+            overlap_enabled=self.scheduler.enable_overlap,
+        )
+        from sglang.srt.layers.ar86_boundary import readback as boundary_readback
+        state["codex_ar86_boundary"] = boundary_readback(self.scheduler.tp_worker.model_runner.model)
+        from sglang.srt.layers.ar87_inventory import readback as ar87_readback
+        state["codex_ar87_inventory"] = ar87_readback(self.scheduler.tp_worker.model_runner.model)
+        from sglang.srt.layers.xpu_tp_bounded_head import readback as tp_head_readback
+        state["codex_tp_bounded_head"] = tp_head_readback(self.scheduler.tp_worker.model_runner.model)
+        from sglang.srt.layers.ar91_silu import readback as silu_readback
+        state["codex_ar91_silu"] = silu_readback(self.scheduler.tp_worker.model_runner.model)
+        from sglang.srt.layers.ar1444_shared import readback as fused_shared_readback
+        state["codex_ar1444_shared"] = fused_shared_readback(self.scheduler.tp_worker.model_runner.model)
+        from sglang.srt.layers.ar1502_pregate import readback as pregate_readback
+        state["codex_ar1502_pregate"] = pregate_readback(self.scheduler.tp_worker.model_runner.model)
+        from sglang.srt.layers.ar1657_shared_union import readback as union_readback
+        state["codex_ar1657_union"] = union_readback(self.scheduler.tp_worker.model_runner.model)
+        from sglang.srt.layers.ar1532_outnorm import readback as projection_norm_readback
+        state["codex_ar1532_outnorm"] = projection_norm_readback(self.scheduler.tp_worker.model_runner.model)
+        from sglang.srt.managers.ar1564_relay import readback as relay_readback
+        state["codex_ar1564_relay"] = relay_readback(self.scheduler.future_map)
+        from sglang.srt.layers.ar266_argmax import readback as argmax_readback
+        state["codex_ar266_argmax"] = argmax_readback()
+        from sglang.srt.layers.moe.paged_experts.cpu_publish362 import readback as route_readback
+        state["codex_ar606_route"] = route_readback()
+        from sglang.srt.layers.ar612_attention import readback as attention_readback
+        state["codex_ar612_attention"] = attention_readback()
+        from sglang.srt.layers.ar646_input import readback as input_readback
+        state["codex_ar646_input"] = input_readback()
+        from sglang.srt.layers.ar1776_inputconv import readback as inputconv_readback
+        state["codex_ar1776_inputconv"] = inputconv_readback()
+        from sglang.srt.layers.ar671_output import readback as output_readback
+        state["codex_ar671_output"] = output_readback()
+        from sglang.srt.layers.ar728_shared import readback as shared_readback
+        state["codex_ar728_shared"] = shared_readback()
+        from sglang.srt.layers.ar101_joint import readback as ar101_readback
+        state["codex_ar101_joint"] = ar101_readback(self.scheduler.tp_worker.model_runner.model)
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(state))
 
     def _add_topology(self, state: Dict[str, Any]) -> None:

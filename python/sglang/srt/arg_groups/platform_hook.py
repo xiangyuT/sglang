@@ -140,9 +140,10 @@ def handle_xpu_backends(server_args: Any):
         elif cfg.cuda_graph_config.decode.backend not in (
             Backend.DISABLED,
             Backend.FULL,
+            Backend.BREAKABLE,
         ):
             logger.warning(
-                "XPU platform only supports decode backend 'full'; "
+                "XPU platform supports decode backends 'full' and 'breakable'; "
                 "disabling unsupported decode backend '%s'.",
                 cfg.cuda_graph_config.decode.backend,
             )

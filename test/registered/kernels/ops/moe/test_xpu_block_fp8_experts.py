@@ -5,8 +5,13 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
+import triton
+import triton.language as tl
 
-from sglang.kernels.ops.moe.xpu_block_fp8_experts import xpu_block_fp8_experts
+from sglang.kernels.ops.moe.xpu_block_fp8_experts import (
+    _dequant_weight,
+    xpu_block_fp8_experts,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.paged_experts.xpu import _supports_expert_gemv
@@ -14,6 +19,15 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_xpu_ci(est_time=45, suite="xpu-unit-test")
+
+
+@triton.jit
+def _check_scaled_fp32(X, S, Y, SMALL: tl.constexpr):
+    column = tl.arange(0, 256)
+    value = tl.load(X + column)
+    scale = tl.load(S + tl.program_id(0))
+    output = _dequant_weight(value, scale, SMALL)
+    tl.store(Y + tl.program_id(0) * 256 + column, output)
 
 
 @unittest.skipUnless(torch.xpu.is_available(), "requires an Intel XPU")
@@ -90,7 +104,9 @@ class TestXpuBlockFp8Experts(CustomTestCase):
                 args[0][:, 128:256] *= 4
             elif mode == "zero":
                 args[0].zero_()
-            actual = xpu_block_fp8_experts(*args)
+            actual = xpu_block_fp8_experts(*args, scaled_fp8=True)
+            original = xpu_block_fp8_experts(*args)
+            torch.testing.assert_close(actual, original, rtol=0, atol=0)
             with self.subTest(mode=mode):
                 self._assert_close(actual, self._native(*args))
                 self._assert_close(actual, self._reference(*args))
@@ -104,7 +120,7 @@ class TestXpuBlockFp8Experts(CustomTestCase):
         torch.xpu.synchronize()
         graph = torch.xpu.XPUGraph()
         with torch.xpu.graph(graph):
-            actual = xpu_block_fp8_experts(*args)
+            actual = xpu_block_fp8_experts(*args, scaled_fp8=True)
         for step in range(6):
             x.normal_()
             ids.copy_(torch.randint(0, 16, ids.shape, dtype=ids.dtype, device="xpu"))
@@ -118,11 +134,42 @@ class TestXpuBlockFp8Experts(CustomTestCase):
                 weights[0, ::2] = 0
             graph.replay()
             with self.subTest(step=step):
+                torch.testing.assert_close(
+                    actual, xpu_block_fp8_experts(*args), rtol=0, atol=0
+                )
                 self._assert_close(actual, self._native(*args))
                 if step in (0, 5):
                     self._assert_close(actual, self._reference(*args))
                 if step == 0:
                     self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
+
+    def test_scaled_decode_fp32_exponents_and_subnormals(self):
+        codes = torch.arange(256, device="xpu", dtype=torch.uint8).view(
+            torch.float8_e4m3fn
+        )
+        powers = torch.exp2(torch.arange(-118, 119, device="xpu").float())
+        scales = torch.cat(
+            (
+                powers,
+                -powers,
+                powers * 1.5,
+                -powers * 1.5,
+                torch.zeros(1, device="xpu"),
+                torch.rand(4096, device="xpu") * 0.002,
+            )
+        )
+        scales = scales[scales.abs() <= 2.0**118]
+        expected = torch.empty((len(scales), 256), device="xpu")
+        actual = torch.empty_like(expected)
+        _check_scaled_fp32[(len(scales),)](codes, scales, expected, SMALL=False)
+        _check_scaled_fp32[(len(scales),)](codes, scales, actual, SMALL=True)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+        finite = torch.isfinite(expected)
+        self.assertTrue(
+            torch.equal(
+                actual[finite].view(torch.int32), expected[finite].view(torch.int32)
+            )
+        )
 
     def test_dispatch_guards(self):
         _, w13, w2, s13, s2, _, _ = self._inputs()

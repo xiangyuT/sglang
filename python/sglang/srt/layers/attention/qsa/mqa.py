@@ -472,6 +472,14 @@ def qsa_mqa_decode(
     *,
     min_scored_len: int = 0,
 ) -> torch.Tensor:
+    if q.device.type == "xpu":
+        from sglang.kernels.ops.attention.xpu_qsa_sycl import try_decode_scores
+
+        scores = try_decode_scores(
+            q, k_cache, page_table, context_lens, max_model_len, score_scale
+        )
+        if scores is not None:
+            return scores
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q,

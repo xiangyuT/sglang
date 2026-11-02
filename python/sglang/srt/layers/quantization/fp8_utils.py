@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
+    get_spec,
 )
 from sglang.srt.utils import (
     ceil_align,
@@ -59,6 +60,12 @@ if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _log_ar_long_k_scaled_fp8():
+    logger.info("Using B70 AR K192 long-K FP8/256 GEMV, warp8/GRF256")
+
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -767,8 +774,38 @@ def torch_w8a8_block_fp8_linear(
         else torch.nn.functional.ScalingType.BlockWise128x128
     )
     input_2d = input.reshape(-1, input.shape[-1])
+    if (
+        envs.SGLANG_XPU_PAGED_DFLASH.get()
+        and envs.SGLANG_XPU_DFLASH_DENSE_DPAS.get()
+        and envs.SGLANG_XPU_DFLASH_SMALL_TLA.get()
+    ):
+        from sglang.kernels.ops.gemm.xpu_dflash_small_tla import (
+            can_use_small_tla,
+            small_tla,
+        )
+
+        if can_use_small_tla(
+            input_2d, weight, weight_scale, block_size, input_scale, bias
+        ):
+            return small_tla(input_2d, weight, weight_scale).view(
+                *input.shape[:-1], weight.shape[0]
+            )
     if input_scale is None:
-        q_input, activation_scale = per_token_group_quant_fp8(input_2d, block_k)
+        use_sycl_quant = False
+        if (
+            envs.SGLANG_XPU_PAGED_DFLASH.get()
+            and envs.SGLANG_XPU_DFLASH_QUANT_SYCL.get()
+        ):
+            from sglang.kernels.ops.quantization.dflash_quant_sycl import (
+                can_use_dflash_quant,
+                dflash_quant,
+            )
+
+            use_sycl_quant = can_use_dflash_quant(input_2d)
+        if use_sycl_quant:
+            q_input, activation_scale = dflash_quant(input_2d)
+        else:
+            q_input, activation_scale = per_token_group_quant_fp8(input_2d, block_k)
     else:
         q_input = input_2d
         activation_scale = input_scale.reshape(-1, input_scale.shape[-1])
@@ -777,6 +814,61 @@ def torch_w8a8_block_fp8_linear(
         q_input = q_input.contiguous()
     if weight.stride(-1) != 1:
         weight = weight.contiguous()
+    if (
+        envs.SGLANG_XPU_PAGED_DFLASH.get()
+        and envs.SGLANG_XPU_DFLASH_DENSE_DPAS.get()
+        and (input_scale is not None or input.dtype == torch.bfloat16)
+    ):
+        if (
+            envs.SGLANG_XPU_DFLASH_DENSE_SYCL.get()
+            and envs.SGLANG_XPU_DFLASH_LONG_DENSE_SYCL.get()
+        ):
+            from sglang.kernels.ops.gemm.xpu_dflash_long_dense_sycl import (
+                can_use_long_dense,
+                long_dense_sycl,
+            )
+
+            if can_use_long_dense(
+                q_input, weight, activation_scale, weight_scale, block_size, bias
+            ):
+                return long_dense_sycl(
+                    q_input, weight, activation_scale, weight_scale
+                ).view(*input.shape[:-1], weight.shape[0])
+        from sglang.kernels.ops.gemm.xpu_dflash_dense_dpas import (
+            can_use_dense_dpas,
+            dense_dpas,
+        )
+
+        if can_use_dense_dpas(
+            q_input, weight, activation_scale, weight_scale, block_size, bias
+        ):
+            return dense_dpas(q_input, weight, activation_scale, weight_scale).view(
+                *input.shape[:-1], weight.shape[0]
+            )
+    if bias is None and envs.SGLANG_XPU_TP_AUX_FP8_SYCL.get() and (
+        input_scale is not None or input.dtype == torch.bfloat16
+    ):
+        from sglang.kernels.ops.gemm.xpu_tp_aux_fp8_sycl import (
+            can_use_tp_aux_projection,
+            tp_aux_projection,
+        )
+
+        if can_use_tp_aux_projection(q_input, weight, activation_scale, weight_scale):
+            return tp_aux_projection(q_input, weight, activation_scale, weight_scale).view(
+                *input.shape[:-1], weight.shape[0]
+            )
+    if bias is None and envs.SGLANG_XPU_TP_BLOCK_FP8_SYCL.get() and (
+        input_scale is not None or input.dtype == torch.bfloat16
+    ):
+        from sglang.kernels.ops.gemm.xpu_tp_block_fp8_sycl import (
+            can_use_tp_projection,
+            tp_projection,
+        )
+
+        if can_use_tp_projection(q_input, weight, activation_scale, weight_scale):
+            return tp_projection(q_input, weight, activation_scale, weight_scale).view(
+                *input.shape[:-1], weight.shape[0]
+            )
     if (
         envs.SGLANG_XPU_M1_BLOCK_FP8_GEMV.get()
         and q_input.device.type == "xpu"
@@ -802,7 +894,48 @@ def torch_w8a8_block_fp8_linear(
     ):
         from sglang.kernels.ops.gemm.xpu_block_fp8_gemv import xpu_block_fp8_gemv
 
-        return xpu_block_fp8_gemv(q_input, weight, activation_scale, weight_scale).view(
+        compensate_long_k = (
+            envs.SGLANG_XPU_AR_LONG_K_SCALED_FP8.get()
+            and tuple(weight.shape) == (2048, 4096)
+            and envs.SGLANG_XPU_M1_BLOCK_FP8_LONG_K_WARP8.get()
+            and get_spec().speculative_algorithm is None
+            and get_exec().moe.enable_paged_experts
+            and get_exec().moe.paged_experts_num_resident == 192
+        )
+        if compensate_long_k:
+            _log_ar_long_k_scaled_fp8()
+        return xpu_block_fp8_gemv(
+            q_input,
+            weight,
+            activation_scale,
+            weight_scale,
+            compensate_long_k=compensate_long_k,
+        ).view(*input.shape[:-1], weight.shape[0])
+    if (
+        envs.SGLANG_XPU_PAGED_DFLASH.get()
+        and envs.SGLANG_XPU_DFLASH_SHARED_GEMV.get()
+        and 2 <= q_input.shape[0] <= 8
+        and q_input.device.type == "xpu"
+        and q_input.dtype == weight.dtype == torch.float8_e4m3fn
+        and (input_scale is not None or input.dtype == torch.bfloat16)
+        and q_input.shape[1] == weight.shape[1]
+        and tuple(weight.shape) == (1024, 2048)
+        and q_input.is_contiguous()
+        and weight.is_contiguous()
+        and activation_scale.is_contiguous()
+        and activation_scale.dtype == weight_scale.dtype == torch.float32
+        and weight_scale.shape == (weight.shape[0] // 128, weight.shape[1] // 128)
+        and q_input.device
+        == weight.device
+        == activation_scale.device
+        == weight_scale.device
+        and block_n == 128
+        and bias is None
+        and torch.xpu.get_device_properties(q_input.device).device_id == 0xE223
+    ):
+        from sglang.kernels.ops.gemm.xpu_dflash_gemm import shared_gemv
+
+        return shared_gemv(q_input, weight, activation_scale, weight_scale).view(
             *input.shape[:-1], weight.shape[0]
         )
     weight_t = weight.t()

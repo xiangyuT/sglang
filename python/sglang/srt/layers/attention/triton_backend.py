@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
-
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
@@ -32,7 +32,7 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -61,6 +61,8 @@ from sglang.srt.utils import (
     is_xpu,
     next_power_of_2,
 )
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -598,6 +600,21 @@ class TritonAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
     ):
         """Fill all cuda-graph buffers for target_verify mode."""
+        if (
+            _is_xpu
+            and self.is_draft_runner
+            and envs.SGLANG_XPU_PAGED_DFLASH.get()
+            and envs.SGLANG_XPU_DFLASH_SYCL_METADATA.get()
+        ):
+            from sglang.kernels.ops.attention.dflash_metadata_sycl import (
+                try_update_metadata,
+            )
+
+            result = try_update_metadata(
+                self, plan, bs, seq_lens, spec_info, req_pool_indices
+            )
+            if result is not None:
+                return result
         num_tokens_per_req = self._target_verify_num_tokens_per_req(spec_info)
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
@@ -1912,10 +1929,50 @@ class TritonAttnBackend(AttentionBackend):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            saved_paged_kv=self._saved_dflash_paged_kv(
+                forward_batch, layer, save_kv_cache
+            ),
         )
         return o
 
-    def _forward_extend_kernel(self, layer, *args, **kwargs):
+    def _saved_dflash_paged_kv(self, forward_batch, layer, save_kv_cache):
+        # DFlash proposals use TARGET_VERIFY with prefix-only metadata, even
+        # though these are draft-model tokens. See DFlashWorkerV2's block ForwardBatch construction.
+        if not (
+            _is_xpu
+            and self.is_draft_runner
+            and envs.SGLANG_XPU_DFLASH_ATTENTION_PAGED_TLA.get()
+            and self.page_size == 128
+            and save_kv_cache
+            and type(self.token_to_kv_pool) is MHATokenToKVPool
+            and forward_batch.forward_mode.is_target_verify()
+            and forward_batch.spec_algorithm.is_dflash()
+            and layer.attn_type == AttentionType.ENCODER_ONLY
+        ):
+            return None
+        return (
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.kv_indices,
+            forward_batch.out_cache_loc,
+        )
+
+    def _forward_extend_kernel(self, layer, *args, saved_paged_kv=None, **kwargs):
+        if (
+            _is_xpu
+            and self.is_draft_runner
+            and envs.SGLANG_XPU_PAGED_DFLASH.get()
+            and envs.SGLANG_XPU_DFLASH_ATTENTION.get()
+            and self.dllm_attention is None
+        ):
+            from sglang.kernels.ops.speculative.dflash_attention_xpu import (
+                try_xpu_dflash_attention,
+            )
+
+            if try_xpu_dflash_attention(*args, saved_paged_kv=saved_paged_kv, **kwargs):
+                if not getattr(self, "_logged_xpu_dflash_attention", False):
+                    logger.info("Using B70 bidirectional DFLASH draft attention.")
+                    self._logged_xpu_dflash_attention = True
+                return
         if self.dllm_attention is not None:
             return self.dllm_attention.forward_extend(layer, *args, **kwargs)
         return self.extend_attention_fwd(*args, **kwargs)

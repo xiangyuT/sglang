@@ -509,7 +509,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 self.backend.capture_one(
                     shape_key,
                     run_once,
-                    capture_inputs=None,
+                    capture_inputs=forward_batch,
                     post_warmup_hook=post_warmup_hook,
                 )
 

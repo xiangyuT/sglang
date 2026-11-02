@@ -1349,6 +1349,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 {"weight_bf16": cached_weight} if cached_weight is not None else {}
             )
             if isinstance(x, tuple):
+                from sglang.srt.layers.ar86_boundary import record_consumer
+                record_consumer(layer, x)
                 return self.w8a8_block_fp8_linear(
                     input=x[0],
                     weight=layer.weight,
@@ -3054,10 +3056,46 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sgl_kernel import fused_experts
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
+            replica_routing = getattr(dispatch_output, "xpu_replica_routing", None)
+            if (
+                (envs.SGLANG_XPU_TP_EXPERT_DOWN_SYCL.get()
+                 or envs.SGLANG_XPU_TP_EXPERT_GU_SYCL.get())
+                and self.block_quant
+                and list(self.quant_config.weight_block_size) == [128, 128]
+                and not self.is_fp4_expert
+            ):
+                from sglang.kernels.ops.moe.xpu_tp_expert_down_sycl import (
+                    can_use_tp_expert_down,
+                    tp_expert_down,
+                )
+
+                if can_use_tp_expert_down(layer, moe_runner_config, x, topk_ids, topk_weights):
+                    if envs.SGLANG_XPU_TP_EXPERT_GU_SYCL.get():
+                        from sglang.kernels.ops.moe.xpu_tp_expert_gu_sycl import tp_expert_gu
+
+                        return StandardCombineInput(
+                            hidden_states=tp_expert_gu(
+                                layer, x, topk_ids, topk_weights,
+                                replica_routing=replica_routing,
+                            )
+                        )
+                    return StandardCombineInput(
+                        hidden_states=tp_expert_down(layer, x, topk_ids, topk_weights)
+                    )
+            if replica_routing is not None:
+                from sglang.kernels.ops.moe.xpu_ep_replica_sycl import replica_local_ids
+
+                topk_ids = replica_local_ids(topk_ids, *replica_routing)
             assert layer.w13_weight.dtype == layer.w2_weight.dtype
             use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
             assert self.is_fp4_expert == use_mxfp4_w4a16
+            if (envs.SGLANG_XPU_EP_SAFE_ROUTES.get()
+                    and get_parallel().moe_ep_size > 1
+                    and get_moe_a2a_backend().is_none()):
+                from sglang.kernels.ops.moe.xpu_ep_routes import mask_nonlocal_routes
+
+                topk_ids, topk_weights = mask_nonlocal_routes(topk_ids, topk_weights)
             output = fused_experts(
                 x,
                 layer.w13_weight,

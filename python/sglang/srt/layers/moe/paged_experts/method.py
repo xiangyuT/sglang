@@ -6,6 +6,7 @@ import logging
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.paged_experts.executor import DeviceExecutor, EagerExecutor
 from sglang.srt.layers.moe.paged_experts.formats import (
     ExpertFormat,
@@ -172,6 +173,19 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             else:
                 self.store.bind_device_gather(layer)
                 self.device_executor = DeviceExecutor(**executor_args)
+        prefill_priority = (
+            envs.SGLANG_XPU_AR_PREFILL_PRIORITY.get()
+            and xpu_device_path
+            and self.num_resident == 192
+            and self.num_experts == 256
+            and get_spec().speculative_algorithm is None
+            and torch.xpu.get_device_properties(device).device_id == 0xE223
+        )
+        if prefill_priority and self.base_method.runner.config.layer_id == 0:
+            logger.info(
+                "Using B70 AR prefill expert-cache priority: recent64/full "
+                "frequency and last position; decode keeps device LRU."
+            )
         self.executor = EagerExecutor(
             base_method=self.base_method,
             store=self.store,
@@ -180,11 +194,14 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             num_experts=self.num_experts,
             routed_scaling_factor=self.routed_scaling_factor,
             device_residency=residency,
+            prefill_priority=prefill_priority,
         )
 
-    def apply(self, layer, dispatch_output):
+    def apply(self, layer, dispatch_output, ar_joint=None):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        from sglang.srt.layers.moe.paged_experts.cpu40 import before_apply
+        before_apply(dispatch_output)
         # Decided from shapes alone, so a captured graph always takes the same path.
         topk_output = dispatch_output.topk_output
         if (
@@ -192,8 +209,10 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             and topk_output.topk_ids.numel() <= self.num_resident
         ):
             return self.device_executor.run(
-                layer=layer, dispatch_output=dispatch_output
+                layer=layer, dispatch_output=dispatch_output,
+                **({"ar_joint": ar_joint} if ar_joint is not None else {}),
             )
+        assert ar_joint is None, "AR101 requires guarded XPU device executor"
         if is_in_breakable_cuda_graph():
             # The host-planned waves run as an eager break between graph segments.
             assert (
@@ -250,7 +269,12 @@ def make_for_layer(layer, base_method) -> PagedExpertsMoEMethod:
     num_resident = min(get_exec().moe.paged_experts_num_resident, num_experts)
     if check_cuda_graph_backend(Phase.DECODE, Backend.FULL):
         # A full decode graph cannot break out for host-planned waves.
-        _cap_decode_capture_batch_sizes(max(1, num_resident // _router_top_k(layer)))
+        tokens_per_req = 1
+        if get_spec().speculative_algorithm == "DFLASH":
+            tokens_per_req = get_spec().speculative_num_draft_tokens
+        _cap_decode_capture_batch_sizes(
+            max(1, num_resident // (_router_top_k(layer) * tokens_per_req))
+        )
     return PagedExpertsMoEMethod(
         base_method=base_method,
         expert_format=expert_format,
@@ -272,7 +296,8 @@ def _cap_decode_capture_batch_sizes(max_bs: int) -> None:
     capture_bs = sorted({bs for bs in decode.bs if bs <= cap} | {cap})
     if capture_bs != list(decode.bs):
         logger.info(
-            "Paged experts: decode CUDA graphs captured at batch sizes %s (at most K // top_k)",
+            "Paged experts: decode CUDA graphs captured at batch sizes %s "
+            "(routed entries per captured step fit K)",
             capture_bs,
         )
     decode.bs = capture_bs
@@ -302,8 +327,31 @@ def check_paged_experts_compat(layer, expert_format) -> None:
             problems.append(f"--{name.replace('_', '-')} must be 1 (single GPU only)")
     if get_exec().moe.enable_eplb:
         problems.append("--enable-eplb is not supported")
-    if get_spec().speculative_algorithm:
-        problems.append("speculative decoding is not supported")
+    spec = get_spec()
+    if spec.speculative_algorithm:
+        paged_dflash = (
+            envs.SGLANG_XPU_PAGED_DFLASH.get()
+            and get_platform().is_xpu
+            and isinstance(expert_format, Fp8BlockFormat)
+            and spec.speculative_algorithm == "DFLASH"
+            and getattr(spec, "speculative_eagle_topk", None) == 1
+        )
+        if not paged_dflash:
+            problems.append(
+                "speculative decoding requires opt-in XPU block-FP8 DFLASH "
+                "with a linear draft chain (SGLANG_XPU_PAGED_DFLASH=1)"
+            )
+        elif (
+            not isinstance(spec.speculative_num_draft_tokens, int)
+            or spec.speculative_num_draft_tokens < 2
+            or get_exec().moe.paged_experts_num_resident is None
+            or spec.speculative_num_draft_tokens * _router_top_k(layer)
+            > get_exec().moe.paged_experts_num_resident
+        ):
+            problems.append(
+                "DFLASH verify window must contain at least 2 tokens and fit "
+                "one resident expert wave (verify tokens * router top-k <= K)"
+            )
     # Host-planned waves run as eager breaks in a breakable prefill graph; a full graph only
     # captures steps that fit one wave, which decode can be limited to and prefill cannot.
     if not (

@@ -1,11 +1,20 @@
+import logging
+from functools import lru_cache
 from typing import Optional
 
 import torch
 import triton
-
 from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update_kernel,
 )
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _log_narrow_verify():
+    logger.info("Using B70 DFlash GDN verify BV=4 (T=4, FP32 checkpoints)")
 
 
 def fused_sigmoid_gating_delta_rule_update(
@@ -31,6 +40,7 @@ def fused_sigmoid_gating_delta_rule_update(
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
+    round_gdn_gate_to_bf16: bool = False,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -57,6 +67,31 @@ def fused_sigmoid_gating_delta_rule_update(
         triton.next_power_of_2(K),
         min(triton.next_power_of_2(V), 16),
     )  # use 16 here to reduce register pressure
+    if (
+        envs.SGLANG_XPU_PAGED_DFLASH.get()
+        and envs.SGLANG_XPU_DFLASH_GDN_NARROW.get()
+        and B == N == 1
+        and T == cache_steps == 4
+        and (H, HV, K, V) == (16, 32, 128, 128)
+        and not is_kda
+        and disable_state_update
+        and use_qk_l2norm_in_kernel
+        and round_gdn_gate_to_bf16
+        and retrieve_parent_token is None
+        and lower_bound is None
+        and cu_seqlens is not None
+        and initial_state_source is not None
+        and initial_state_source.dtype == torch.float32
+        and intermediate_states_buffer is not None
+        and intermediate_states_buffer.dtype == torch.float32
+        and all(t.dtype == torch.bfloat16 for t in (q, k, v, a, b, dt_bias))
+        and q.device.type == "xpu"
+        and torch.xpu.get_device_properties(q.device).device_id == 0xE223
+    ):
+        # Keep the same K reduction and arithmetic. The smaller value tile
+        # removes the measured BV16 spill without adding a kernel launch.
+        BV = 4
+        _log_narrow_verify()
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
@@ -130,6 +165,7 @@ def fused_sigmoid_gating_delta_rule_update(
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         USE_LOWER_BOUND=lower_bound is not None,
+        ROUND_GDN_GATE_TO_BF16=round_gdn_gate_to_bf16,
         num_warps=num_warps,
         num_stages=num_stages,
     )

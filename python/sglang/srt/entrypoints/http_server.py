@@ -128,6 +128,7 @@ from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
+    ParkSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -1671,6 +1672,13 @@ async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Req
         return session_id
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.post("/park_session")
+async def park_session(obj: Annotated[ParkSessionReqInput, Body()], request: Request):
+    """Park an idle session's reusable prefix in host L2 without closing it."""
+    result = await _global_state.tokenizer_manager.park_session(obj)
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=200 if result.success else 409)
 
 
 @app.api_route("/close_session", methods=["GET", "POST"])

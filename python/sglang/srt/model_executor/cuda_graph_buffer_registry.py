@@ -29,8 +29,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
+import os
+
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
@@ -42,6 +45,7 @@ if TYPE_CHECKING:
 
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
+_CODEX_AR1817_FILL = os.environ.get("CODEX_AR1817_FILL") == "1"
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
@@ -59,6 +63,17 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
 
     if dsts and dsts[0].is_cuda:
         from sglang.kernels.ops.memory.small_copy import try_small_copy
+
+        if try_small_copy(dsts, srcs):
+            return
+
+    if (
+        dsts
+        and dsts[0].device.type == "xpu"
+        and envs.SGLANG_XPU_PAGED_DFLASH.get()
+        and envs.SGLANG_XPU_DFLASH_SMALL_COPY_SYCL.get()
+    ):
+        from sglang.kernels.ops.memory.xpu_small_copy_sycl import try_small_copy
 
         if try_small_copy(dsts, srcs):
             return
@@ -419,13 +434,20 @@ class CudaGraphBufferRegistry:
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        # Phase 1: reset padded regions where it matters.
-        for slot in self._slots.values():
-            if not slot.enabled or slot.buffer is None:
-                continue
-            raw_n = slot._raw_n(raw_bs, raw_num_tokens)
-            padded_n = slot._padded_n(padded_bs, padded_num_tokens)
-            slot.reset_padding(raw_n, padded_n)
+        # Every reset is a no-op when neither registry axis is padded.
+        # Keep the existing per-slot path for any padded axis and leave
+        # all copies, source functions and post-fill hooks unchanged.
+        if (
+            not _CODEX_AR1817_FILL
+            or raw_bs < padded_bs
+            or raw_num_tokens < padded_num_tokens
+        ):
+            for slot in self._slots.values():
+                if not slot.enabled or slot.buffer is None:
+                    continue
+                raw_n = slot._raw_n(raw_bs, raw_num_tokens)
+                padded_n = slot._padded_n(padded_bs, padded_num_tokens)
+                slot.reset_padding(raw_n, padded_n)
 
         # Phase 2: collect (dst, src) pairs and dispatch a grouped copy.
         gpu_dsts: List[torch.Tensor] = []

@@ -2423,6 +2423,18 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
+class ParkSessionReqInput(BaseReq, kw_only=True):
+    session_id: str
+
+
+class ParkSessionReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    device_tokens_released: int = 0
+    mamba_states_released: int = 0
+    retained_device_tokens: int = 0
+
+
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool

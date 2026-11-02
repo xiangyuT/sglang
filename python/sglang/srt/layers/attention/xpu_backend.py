@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import msgspec
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMetadata,
@@ -42,6 +44,47 @@ from sgl_kernel import (
     merge_state_v2,
 )
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+logger = logging.getLogger(__name__)
+
+
+def ar_decode_split_count(
+    q: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    page_table: Optional[torch.Tensor],
+    configured: int,
+    default: int,
+) -> int:
+    """Select the measured B70 M1 layout; the backend checks AR/device identity.
+
+    Deterministic inference's explicit one-split setting remains authoritative.
+    No tensor value is read on the host, including the changing KV length.
+    """
+    if (
+        configured <= 0
+        or default != 0
+        or q.device.type != "xpu"
+        or q.dtype != torch.bfloat16
+        or q.shape != (1, 16, 256)
+        or not q.is_contiguous()
+        or key_cache.dtype != torch.bfloat16
+        or value_cache.dtype != torch.bfloat16
+        or key_cache.ndim != 4
+        or key_cache.shape != value_cache.shape
+        or key_cache.shape[1:] != (128, 2, 256)
+        or not key_cache.is_contiguous()
+        or not value_cache.is_contiguous()
+        or page_table is None
+        or page_table.dtype != torch.int32
+        or page_table.ndim != 2
+        or page_table.shape[0] != 1
+        or not 0 < page_table.shape[1] <= 32
+        or not page_table.is_contiguous()
+        or not (q.device == key_cache.device == value_cache.device == page_table.device)
+    ):
+        return default
+    return configured
 
 
 class XPUDCPMetadata(msgspec.Struct):
@@ -181,6 +224,30 @@ class XPUAttentionBackend(AttentionBackend):
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
+        dflash_verify = (
+            envs.SGLANG_XPU_PAGED_DFLASH.get()
+            and model_runner.spec_algorithm.is_dflash()
+            and not model_runner.is_draft_worker
+            and torch.xpu.get_device_properties(self.device).device_id == 0xE223
+        )
+        self.dflash_verify_decode = (
+            dflash_verify and envs.SGLANG_XPU_DFLASH_VERIFY_DECODE.get()
+        )
+        self.dflash_native_prefill = (
+            dflash_verify and envs.SGLANG_XPU_DFLASH_NATIVE_PREFILL.get()
+        )
+        if self.dflash_native_prefill:
+            if self.dflash_verify_decode:
+                raise ValueError(
+                    "Select native DFlash prefill or verify decode, not both"
+                )
+            from sglang.kernels.ops.attention.xpu_dflash_prefill import (
+                load_native_prefill,
+            )
+
+            load_native_prefill()
+        self._dflash_verify_decode_logged = False
+        self._dflash_native_prefill_logged = False
 
         # Local attention settings
         self.attention_chunk_size = (
@@ -204,6 +271,18 @@ class XPUAttentionBackend(AttentionBackend):
         self.num_splits = (
             1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
+        ar_splits = envs.SGLANG_XPU_AR_DECODE_SPLITS.get()
+        if ar_splits not in (0, 1, 2, 4, 8):
+            raise ValueError("SGLANG_XPU_AR_DECODE_SPLITS must be 0, 1, 2, 4, or 8")
+        self.ar_decode_splits = (
+            ar_splits
+            if ar_splits
+            and self.num_splits == 0
+            and get_spec().speculative_algorithm is None
+            and torch.xpu.get_device_properties().device_id == 0xE223
+            else 0
+        )
+        self._ar_decode_split_logged = False
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         if self.is_encoder_decoder:
             from sglang.srt.model_executor.cuda_graph_config import (
@@ -895,6 +974,79 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+            if (
+                (self.dflash_verify_decode or self.dflash_native_prefill)
+                and forward_batch.forward_mode.is_target_verify()
+                and forward_batch.batch_size == 1
+                and self.topk <= 1
+                and causal_arg
+                and not use_cascade_attn
+                and not use_local_attn
+                and not self.is_encoder_decoder
+                and not layer.is_cross_attention
+                and window_size == (-1, -1)
+                and bidirectional_block_ids is None
+                and sinks is None
+                and layer.logit_cap == 0.0
+            ):
+                if self.dflash_native_prefill:
+                    from sglang.kernels.ops.attention.xpu_dflash_prefill import (
+                        try_native_dflash_prefill,
+                    )
+
+                    o = try_native_dflash_prefill(
+                        q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        key_cache,
+                        value_cache,
+                        page_table,
+                        cache_seqlens,
+                        cu_seqlens_q,
+                        max_seqlen_q,
+                        layer.scaling,
+                        out=(
+                            forward_batch._attn_output.view(
+                                -1, layer.tp_q_head_num, layer.v_head_dim
+                            )
+                            if forward_batch._attn_output is not None
+                            else None
+                        ),
+                    )
+                    if o is not None:
+                        if not self._dflash_native_prefill_logged:
+                            logger.info(
+                                "Using B70 native DFlash prefill Q16/KV64/SG2; "
+                                "original Q8/subgroup causal math."
+                            )
+                            self._dflash_native_prefill_logged = True
+                        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+                if self.dflash_verify_decode:
+                    # The separate decode experiment can change native rounding.
+                    # Unsupported native-prefill shapes keep the original kernel.
+                    from sglang.kernels.ops.attention.dflash_verify_xpu import (
+                        make_dflash_verify_decode_metadata,
+                    )
+
+                    decode_metadata = make_dflash_verify_decode_metadata(
+                        q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        key_cache,
+                        value_cache,
+                        page_table,
+                        cache_seqlens,
+                        max_seqlen_q,
+                    )
+                    if decode_metadata is not None:
+                        if not self._dflash_verify_decode_logged:
+                            logger.info(
+                                "Using native decode attention for B70 DFlash "
+                                "%s-query causal verification chains.",
+                                max_seqlen_q,
+                            )
+                            self._dflash_verify_decode_logged = True
+                        page_table, cache_seqlens, cu_seqlens_q = decode_metadata
+                        max_seqlen_q = 1
+                        causal_arg = False
+
             result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
@@ -1371,6 +1523,7 @@ class XPUAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        ar_gated_output=None,
     ) -> torch.Tensor:
         if k is None and v is None:
             # Cross-layer KV sharing (Gemma 4): see forward_extend for details.
@@ -1546,24 +1699,62 @@ class XPUAttentionBackend(AttentionBackend):
                 )
 
                 # Default: single-token self-attention
-                result = flash_attn_with_kvcache(
-                    q=q_reshaped,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    cu_seqlens_k_new=None,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    return_softmax_lse=use_cascade_attn,
-                    **kwargs,
+                if (
+                    self.ar_decode_splits
+                    and not use_cascade_attn
+                    and sinks is None
+                    and window_size == (-1, -1)
+                    and layer.logit_cap == 0
+                    and layer.scaling == 0.0625
+                ):
+                    selected = ar_decode_split_count(
+                        q_reshaped,
+                        key_cache,
+                        value_cache,
+                        page_table,
+                        self.ar_decode_splits,
+                        self.num_splits,
+                    )
+                    kwargs["num_splits"] = selected
+                    if selected != self.num_splits and not self._ar_decode_split_logged:
+                        logger.info(
+                            "Using B70 AR M1 paged attention: num_splits=%d, "
+                            "Hq=16, Hkv=2, D=256, page=128; split reduction "
+                            "can change BF16 rounding.",
+                            selected,
+                        )
+                        self._ar_decode_split_logged = True
+                from sglang.srt.layers.ar612_attention import try_run as try_head_batch_attention
+                result = try_head_batch_attention(
+                    self, forward_batch, q_reshaped, key_cache, value_cache, page_table, cache_seqlens,
+                    scale=layer.scaling, causal=causal, window_size=window_size,
+                    softcap=layer.logit_cap, k_descale=k_descale, v_descale=v_descale,
+                    sinks=sinks, cascade=use_cascade_attn, max_q=max_seqlen_q,
+                    post_request=ar_gated_output,
                 )
+                if ar_gated_output is not None:
+                    from sglang.srt.layers.ar2015_attention_post import GatedFp8Output
+                    if isinstance(result, GatedFp8Output):
+                        return result
+                if result is None:
+                    result = flash_attn_with_kvcache(
+                        q=q_reshaped,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        cu_seqlens_k_new=None,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        return_softmax_lse=use_cascade_attn,
+                        **kwargs,
+                    )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     expand = self.forward_metadata_spec_decode_expand

@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from typing import Optional
 
@@ -49,6 +50,13 @@ class GroupedGemmaRMSNorm(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "_xpu_gguf_hc_enabled", False):
+            from sglang.kernels.ops.gemm.gguf_hc_xpu import (
+                eligible, normalize, prefill_norm_eligible,
+            )
+
+            if eligible(x) or prefill_norm_eligible(x):
+                return normalize(x, self.weight, self.variance_epsilon)
         if (
             self._jit_group_size is not None
             and x.is_cuda
@@ -230,7 +238,20 @@ class GatedResidual(HyperConnectionBase):
             )
             return (R + injection).flatten(-2)
 
-        self._mix_compute = torch.compile(_mix_compute)
+        # Opt-in GGUF diagnostic policy. Preserve BF16 pointwise boundaries in
+        # the fallback mix; paired native decode and combine stay unchanged.
+        self._hc_bf16_mix_precision = (
+            config.params_dtype == torch.bfloat16
+            and os.environ.get("SGLANG_XPU_GGUF_HC_BF16_MIX") == "1"
+        )
+        self._mix_compute = torch.compile(
+            _mix_compute,
+            options=(
+                {"emulate_precision_casts": True}
+                if self._hc_bf16_mix_precision
+                else None
+            ),
+        )
         self._combine_compute = torch.compile(_combine_compute)
 
     def mix(
@@ -255,6 +276,19 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
+        if hasattr(self, "_xpu_gguf_hc_down_gate"):
+            from sglang.kernels.ops.gemm.gguf_hc_xpu import eligible, mix
+            from sglang.kernels.ops.gemm.gguf_hc_wide_sycl import (
+                eligible as wide_mix_eligible,
+            )
+
+            if eligible(hyper_input_normed) or wide_mix_eligible(hyper_input_normed):
+                mixed_input, scores = mix(
+                    hyper_input_normed,
+                    self._xpu_gguf_hc_down_gate,
+                    self.input_mix_weight_up.weight,
+                )
+                return mixed_input, (hyper_input, hyper_input_normed, scores)
         if (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
@@ -329,6 +363,27 @@ class GatedResidual(HyperConnectionBase):
         hyper_input, _, partials = residuals
         if (
             partials is not None
+            and block_output.device.type == "xpu"
+            and hasattr(self, "_xpu_gguf_hc_down_gate")
+        ):
+            if (
+                os.environ.get("SGLANG_XPU_GGUF_HC_FUSED_NORM") == "1"
+                and next_norm is not None
+                and next_norm.group_size == self.hidden_size == 2560
+                and self.hc_count == 4
+                and hyper_input.dtype == block_output.dtype == next_norm.weight.dtype == torch.bfloat16
+                and partials.dtype == torch.bfloat16
+                and 1 <= block_output.shape[0] <= 4
+            ):
+                from sglang.kernels.ops.gemm.gguf_hc_xpu import combine_and_normalize
+
+                return combine_and_normalize(
+                    block_output, hyper_input, partials, next_norm.weight,
+                    next_norm.variance_epsilon,
+                )
+            return self.combine(block_output, residuals), None
+        if (
+            partials is not None
             and next_norm is not None
             and next_norm.group_size == self.hidden_size
             and next_norm.weight.dtype == torch.bfloat16
@@ -356,6 +411,14 @@ class GatedResidual(HyperConnectionBase):
         residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
     ) -> torch.Tensor:
         hyper_input, hyper_input_normed, partials = residuals
+        if (
+            partials is not None
+            and block_output.device.type == "xpu"
+            and hasattr(self, "_xpu_gguf_hc_down_gate")
+        ):
+            from sglang.kernels.ops.gemm.gguf_hc_xpu import combine
+
+            return combine(block_output, hyper_input, partials)
         if partials is not None:
             from sglang.kernels.ops.elementwise.hc_combine_decode import (
                 hc_combine_apply,

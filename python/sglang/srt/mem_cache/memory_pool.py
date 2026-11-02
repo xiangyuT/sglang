@@ -98,6 +98,8 @@ from sglang.srt.utils.async_probe import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
+    from sglang.kernels.ops.attention.gguf_gdn_sycl import GGUFGdnScratch
+    from sglang.kernels.ops.attention.dflash_gdn_sycl import GdnScratch
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MHABufferInfo
@@ -545,6 +547,8 @@ class MambaPool:
                     kwargs[name] = None
                 elif name in ("conv", "intermediate_conv_window"):
                     kwargs[name] = [conv[layer] for conv in v]
+                elif name in ("dflash_sycl", "gguf_gdn_sycl"):
+                    kwargs[name] = v.at_layer_idx(layer)
                 else:
                     kwargs[name] = v[layer]
 
@@ -552,7 +556,11 @@ class MambaPool:
 
         def mem_usage_bytes(self):
             return sum(
-                get_tensor_size_bytes(getattr(self, f.name))
+                get_tensor_size_bytes(
+                    getattr(self, f.name).buffers
+                    if f.name in ("dflash_sycl", "gguf_gdn_sycl")
+                    else getattr(self, f.name)
+                )
                 for f in dataclasses.fields(self)
                 if getattr(self, f.name) is not None
             )
@@ -564,6 +572,10 @@ class MambaPool:
         # full-state snapshots are never produced or consumed.
         intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
+        # One in-flight M4 linear verify window, owned by this pool. These are
+        # transient scratch, not slot-indexed checkpoint or host-transfer state.
+        dflash_sycl: Optional[GdnScratch] = None
+        gguf_gdn_sycl: Optional[GGUFGdnScratch] = None
 
     def _detect_conv_window_axis(
         self, conv_state_shape: List[Tuple[int, int]], win_len: int
@@ -875,7 +887,18 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                gguf_delta_only = (
+                    os.environ.get("SGLANG_XPU_GGUF_GDN_SKIP_CHECKPOINTS") == "1"
+                    and os.environ.get("SGLANG_XPU_GGUF_GDN_SYCL") == "1"
+                    and temporal_state.shape[0] == 36
+                    and tuple(temporal_state.shape[2:]) in (
+                        (48, 128, 128), (24, 128, 128), (12, 128, 128)
+                    )
+                )
+                # The selected GGUF verifier writes delta records and its
+                # commit folds them into temporal. allocate_scratch below
+                # validates the complete runtime contract before use.
+                if enable_linear_replayssm_spec or gguf_delta_only:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -961,6 +984,34 @@ class MambaPool:
                         for conv_shape in dense_conv_shapes
                     ]
                     self._intermediate_conv_window_phys = intermediate_conv_window_cache
+                dflash_sycl = None
+                gguf_gdn_sycl = None
+                if (
+                    os.environ.get("SGLANG_XPU_GGUF_GDN_SYCL") == "1"
+                    and temporal_state.shape[0] == 36
+                    and tuple(temporal_state.shape[2:]) in (
+                        (48, 128, 128), (24, 128, 128), (12, 128, 128)
+                    )
+                ):
+                    from sglang.kernels.ops.attention.gguf_gdn_sycl import allocate_scratch
+
+                    gguf_gdn_sycl = allocate_scratch(
+                        temporal_state, speculative_num_draft_tokens,
+                        is_kda=cache_params.is_kda, replayssm=_replayssm_on,
+                        envelope=envelope_layout,
+                    )
+                if envs.SGLANG_XPU_DFLASH_GDN_SYCL.get():
+                    from sglang.kernels.ops.attention.dflash_gdn_sycl import (
+                        allocate_scratch,
+                    )
+
+                    dflash_sycl = allocate_scratch(
+                        temporal_state,
+                        speculative_num_draft_tokens,
+                        is_kda=cache_params.is_kda,
+                        replayssm=_replayssm_on,
+                        envelope=envelope_layout,
+                    )
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
@@ -972,6 +1023,8 @@ class MambaPool:
                     replayssm_rawv=replayssm_rawv,
                     replayssm_rawk=replayssm_rawk,
                     replayssm_beta=replayssm_beta,
+                    dflash_sycl=dflash_sycl,
+                    gguf_gdn_sycl=gguf_gdn_sycl,
                 )
                 intermediate_ssm_gb = (
                     get_tensor_size_bytes(intermediate_ssm_state_cache) / GB
@@ -1262,6 +1315,7 @@ class MambaPool:
         {
             "intermediate_ssm",
             "intermediate_conv_window",
+            "gguf_gdn_sycl",
             "replayssm_d",
             "replayssm_k",
             "replayssm_g",
@@ -3337,6 +3391,38 @@ class MHATokenToKVPool(KVCache):
             loc_2d = loc_2d.to(torch.int64)
         if commit_lens.dtype != torch.int32:
             commit_lens = commit_lens.to(torch.int32)
+
+        if (
+            _is_xpu
+            and envs.SGLANG_XPU_PAGED_DFLASH.get()
+            and envs.SGLANG_XPU_DFLASH_PREFIX_KV.get()
+            and cache_k.dtype
+            == cache_v.dtype
+            == self.dtype
+            == self.store_dtype
+            == torch.bfloat16
+            and self.v_row_dim == self.row_dim
+        ):
+            # Copy the exact BF16 bytes at valid prefix rows. This avoids
+            # dynamic nonzero/index_select and is safe to capture with XPU
+            # graphs; positions and commit lengths stay on the device.
+            if not getattr(self, "_xpu_prefix_kv_logged", False):
+                logger.info(
+                    "Using XPU DFlash BF16 device-prefix KV writes; row_dim=%d",
+                    self.row_dim,
+                )
+                self._xpu_prefix_kv_logged = True
+            _set_kv_buffer_prefix_valid_impl(
+                cache_k,
+                cache_v,
+                self.k_buffer[layer_id - self.start_layer],
+                self.v_buffer[layer_id - self.start_layer],
+                loc_2d,
+                commit_lens,
+                row_dim=self.row_dim,
+                store_dtype=self.store_dtype,
+            )
+            return
 
         if not (_is_cuda or _is_hip):
             row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)

@@ -213,7 +213,10 @@ class Sampler(nn.Module):
                 )
                 _aiter_greedy_sample(batch_next_token_ids, logits)
             else:
-                batch_next_token_ids = torch.argmax(logits, -1)
+                from sglang.srt.layers.ar266_argmax import try_run as ar266_argmax
+                batch_next_token_ids = ar266_argmax(logits)
+                if batch_next_token_ids is None:
+                    batch_next_token_ids = torch.argmax(logits, -1)
             _trace_e2e_sampler(
                 "greedy_returned", output_shape=tuple(batch_next_token_ids.shape)
             )

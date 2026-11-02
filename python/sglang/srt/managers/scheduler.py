@@ -133,6 +133,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    ParkSessionReqInput,
+    ParkSessionReqOutput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -1704,6 +1706,22 @@ class Scheduler(
                 "using async D2H copy worker to preserve overlap scheduling."
             )
 
+        # Scoped CPU expert protocol candidate: no device-side wait on COPY.
+        self.codex_cpu74_host_d2h = (
+            self.device == "xpu"
+            and __import__("os").environ.get("CODEX_AR_CPU40") == "1"
+            and __import__("os").environ.get("CODEX_AR_CPU74_D2H_WORKER") == "1"
+        )
+        if self.codex_cpu74_host_d2h:
+            if not self.spec_algorithm.is_none():
+                raise RuntimeError("CPU74 D2H candidate requires pure AR")
+            if self.async_d2h_worker is not None:
+                raise RuntimeError("CPU74 D2H candidate requires an unclaimed copy worker")
+            from sglang.srt.managers.async_d2h_copy_worker import AsyncD2HCopyWorker
+            self.async_d2h_worker = AsyncD2HCopyWorker(self.device_module)
+            self.enable_async_d2h_copy = True
+            logger.info("CPU74 host-ready D2H worker enabled; overlap preserved")
+
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -1791,6 +1809,7 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (ParkSessionReqInput, self.park_session),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -1954,7 +1973,13 @@ class Scheduler(
                 )
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
-        self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        # XPU also overlaps distinct scheduling and forward streams. Protect
+        # shared-table readers before subsequent scheduling writes.
+        self._war_barrier_enabled = (
+            is_cuda()
+            or self.device == "xpu"
+            or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        )
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
@@ -4641,7 +4666,9 @@ class Scheduler(
                             batch, **fwd_kwargs
                         )
                         if batch.spec_algorithm.is_none():
-                            self.future_map.publish(future_indices, batch.seq_lens + 1)
+                            from sglang.srt.managers.ar1564_relay import try_relay
+                            if not try_relay(self, batch, batch_result, future_indices):
+                                self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
@@ -4905,6 +4932,8 @@ class Scheduler(
         batch_result: GenerationBatchResult,
     ) -> None:
         """Stash this iter's relay payload for next iter's resolve_forward_inputs."""
+        if batch_result.ar1564_relayed:
+            return
         if self.spec_algorithm.is_ngram():
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(batch_result.next_draft_input)
@@ -4965,6 +4994,21 @@ class Scheduler(
             return_logprob=batch.return_logprob,
             return_hidden_states=batch.return_hidden_states,
         )
+        if getattr(self, "codex_cpu74_host_d2h", False):
+            # Spec and graph-buffer hidden-state readbacks need a separate lifetime audit.
+            if not batch.spec_algorithm.is_none() or batch.return_hidden_states or batch.return_logprob:
+                raise RuntimeError("CPU74 D2H candidate supports plain AR without hidden states/logprobs")
+            # For greedy AR, TP worker samples outside model graph replay; argmax
+            # allocates per-result token storage, held by copy_fn and FutureMap.
+            # Record readiness on forward itself. A copy-stream wait here would
+            # reintroduce the dependency reproduced by R71/R73.
+            if __import__("os").environ.get("CODEX_AR919_HOST_TOKEN") == "1":
+                from sglang.srt.layers.ar919_host_token import submit_if_eligible
+                if submit_if_eligible(self.async_d2h_worker,batch_result,copy_fn) is not None:
+                    return
+            with self.forward_stream_ctx:
+                batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
+            return
         self.copy_stream.wait_stream(self.forward_stream)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
@@ -6016,6 +6060,27 @@ class Scheduler(
         ):
             return output
         return None
+
+    def park_session(self, recv_req: ParkSessionReqInput):
+        if self.disaggregation_mode != DisaggregationMode.NULL or get_parallel().pp_size != 1:
+            return ParkSessionReqOutput(success=False, message="Session parking currently requires PP1 without PD disaggregation")
+        if not self.enable_hierarchical_cache or not self.enable_session_radix_cache or not hasattr(self.tree_cache, "park_radix_session"):
+            return ParkSessionReqOutput(success=False, message="Session parking requires UnifiedRadixCache with session radix and HiCache enabled")
+        sid = recv_req.session_id
+        requests = list(self.waiting_queue) + list(self.collect_inflight_reqs())
+        if self.chunked_req is not None:
+            requests.append(self.chunked_req)
+        for item in self.grammar_manager.grammar_queue:
+            requests.append(item[0] if isinstance(item, tuple) else item)
+        busy = any(not req.finished() and (req.session_id == sid or
+                   (req.session is not None and req.session.session_id == sid)) for req in requests)
+        if not sid or busy:
+            return ParkSessionReqOutput(success=False, message="Session has an in-flight request or an empty ID")
+        try:
+            result = self.tree_cache.park_radix_session(sid)
+            return ParkSessionReqOutput(success=True, message="Reusable prefix parked in host L2; shared or locked paths stay on device", **result)
+        except (ValueError, RuntimeError) as error:
+            return ParkSessionReqOutput(success=False, message=str(error))
 
     def close_session(self, recv_req: CloseSessionReqInput):
         if self.enable_session_radix_cache:

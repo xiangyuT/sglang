@@ -1259,10 +1259,15 @@ class HybridLinearAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        from sglang.srt.layers.ar188_metadata import enabled, remember, try_fast_out
+        if enabled() and not in_capture and try_fast_out(self, forward_batch):
+            return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
+        if enabled() and in_capture:
+            remember(self, forward_batch)
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return SharedReadEnds.max_of(
@@ -1270,6 +1275,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        from sglang.srt.layers.ar188_metadata import enabled, run_in_graph
+        if enabled() and run_in_graph(self, forward_batch):
+            return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
 
@@ -1602,14 +1610,48 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
-        scatter_mamba_states_after_mtp_verify(
-            mamba_caches,
-            state_indices_tensor,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
-            src_indices_raw=src_indices_raw,
-        )
+        gguf_sycl = getattr(mamba_caches, "gguf_gdn_sycl", None) is not None
+        if gguf_sycl or getattr(mamba_caches, "dflash_sycl", None) is not None:
+            if gguf_sycl:
+                from sglang.kernels.ops.attention.gguf_gdn_sycl import commit_gdn
+            else:
+                from sglang.kernels.ops.attention.dflash_gdn_sycl import commit_gdn
+
+            commit_gdn(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw,
+            )
+            for conv_states, intermediate_conv_window in zip(
+                mamba_caches.conv, mamba_caches.intermediate_conv_window
+            ):
+                fused_conv_window_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window,
+                    state_indices_tensor,
+                    last_correct_step_indices,
+                    src_indices_raw,
+                )
+                if mamba_track_indices is not None:
+                    fused_conv_window_scatter_with_mask(
+                        conv_states,
+                        intermediate_conv_window,
+                        mamba_track_indices,
+                        mamba_steps_to_track,
+                        src_indices_raw,
+                    )
+        else:
+            scatter_mamba_states_after_mtp_verify(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw=src_indices_raw,
+            )
 
         self._update_ple_state_after_mtp_verify(
             state_indices_tensor,
@@ -1629,6 +1671,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         if dst is None or src is None or step_indices_raw.numel() == 0:
             return
+        if dst.device.type == "xpu":
+            from sglang.kernels.ops.memory.gguf_state_copy_sycl import try_scatter
+
+            if try_scatter(dst, src, dst_indices_raw, step_indices_raw, src_indices_raw):
+                return
         if dst.is_cuda and src.is_cuda:
             fused_mamba_state_scatter_with_mask(
                 dst,

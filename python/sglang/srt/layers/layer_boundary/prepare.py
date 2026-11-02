@@ -160,7 +160,19 @@ def _reduce_update_read(
         result = fused(hidden_states, residual, forward_batch)
         if result is not None:
             return result
-    if group is SumGroup.ATTN_TP:
+    precision_sum = False
+    if (group is not None and hidden_states.dtype == torch.float32
+            and hidden_states.device.type == "xpu"):
+        from sglang.srt.layers.quantization.gguf_tp_prefill import (
+            enabled, reduce_prefill_partial,
+        )
+
+        if enabled():
+            hidden_states = reduce_prefill_partial(hidden_states, _sum_group(group))
+            precision_sum = True
+    if precision_sum:
+        pass
+    elif group is SumGroup.ATTN_TP:
         hidden_states = attn_tp_all_reduce(
             hidden_states, forward_batch, may_quantize=update.quantized_sum
         )

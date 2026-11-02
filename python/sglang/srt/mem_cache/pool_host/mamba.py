@@ -35,6 +35,13 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_direct_pf_lf,
         transfer_kv_per_layer_mla,
     )
+elif _is_xpu:
+    from sglang.srt.mem_cache.pool_host._kvcacheio import (
+        require_kvcacheio_ops,
+        transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_direct,
+        transfer_kv_per_layer_direct_pf_lf,
+    )
 if _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
@@ -106,13 +113,17 @@ class MambaPoolHost(HostKVCache):
         ], f"Unsupported layout: {layout}"
 
         if _is_xpu:
-            raise ValueError(
-                "HiCache does not support hybrid Mamba models on XPU: the Mamba KV "
-                "transfer kernels are JIT-built from CUDA source. "
-                "Launch without HiCache host offload "
-                "(--enable-hierarchical-cache, "
-                "--disaggregation-decode-retraction-backup=host_pool)."
-            )
+            from sglang.srt.runtime_context import get_memory
+
+            if layout != "page_first_direct" or get_memory().hicache_io_backend != "direct":
+                raise ValueError("XPU hybrid Mamba HiCache requires --hicache-io-backend direct "
+                                 "and --hicache-mem-layout page_first_direct")
+            require_kvcacheio_ops(pool=type(self).__name__, layout=layout, ops={
+                "direct": {"page_first_direct": (
+                    "transfer_kv_direct", "transfer_kv_per_layer_direct_pf_lf",
+                    "transfer_kv_all_layer_direct_lf_pf",
+                )},
+            })
 
         self.layout = layout
         self.pin_memory = pin_memory
@@ -212,7 +223,8 @@ class MambaPoolHost(HostKVCache):
         ]
 
         self.kv_buffer = self.init_kv_buffer()
-        self._configure_npu_mamba_io()
+        if _is_npu:
+            self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()

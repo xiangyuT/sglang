@@ -632,37 +632,42 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
 
     batch.maybe_evict_swa()
 
-    seq_lens_gpu = batch.seq_lens
-    bs = seq_lens_gpu.shape[0]
-
-    if _alloc_page_size(batch) == 1:
-        # Non-paged allocation
-        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+    from sglang.srt.mem_cache.ar231_prepare import try_prepare
+    prepared = try_prepare(batch,token_per_req)
+    if prepared is not None:
+        out_cache_loc = prepared[3]
     else:
-        # Paged allocation
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, seq_lens_gpu - 1
-        ]
-        seq_lens_next = seq_lens_gpu + token_per_req
-        out_cache_loc = alloc_paged_token_slots_decode(
-            tree_cache=batch.tree_cache,
-            seq_lens=seq_lens_next,
-            seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
-            last_loc=last_loc,
-            token_per_req=token_per_req,
-            req_pool_indices=batch.req_pool_indices,
-            batch=batch,
+        seq_lens_gpu = batch.seq_lens
+        bs = seq_lens_gpu.shape[0]
+
+        if _alloc_page_size(batch) == 1:
+            # Non-paged allocation
+            out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+        else:
+            # Paged allocation
+            last_loc = batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices, seq_lens_gpu - 1
+            ]
+            seq_lens_next = seq_lens_gpu + token_per_req
+            out_cache_loc = alloc_paged_token_slots_decode(
+                tree_cache=batch.tree_cache,
+                seq_lens=seq_lens_next,
+                seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+                last_loc=last_loc,
+                token_per_req=token_per_req,
+                req_pool_indices=batch.req_pool_indices,
+                batch=batch,
+            )
+
+        # Write to req_to_token_pool
+        if batch.model_config.is_encoder_decoder:
+            locs = batch.encoder_lens + seq_lens_gpu
+        else:
+            locs = seq_lens_gpu.clone()
+
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
         )
-
-    # Write to req_to_token_pool
-    if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + seq_lens_gpu
-    else:
-        locs = seq_lens_gpu.clone()
-
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:

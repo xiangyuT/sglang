@@ -20,6 +20,15 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 
 register_kernel(
     KernelSpec(
+        op="moe.xpu_ar_topk",
+        backend=KernelBackend.AOT,
+        target="sglang.kernels.ops.moe.xpu_ar_topk_sycl:xpu_ar_topk",
+        capabilities=frozenset({CapabilityRequirement.XPU}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.shared_expert_gate",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.shared_expert_gate:shared_expert_gate",

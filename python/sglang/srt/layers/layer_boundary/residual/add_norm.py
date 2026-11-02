@@ -344,11 +344,17 @@ class NormQuantReadout:
     reads_before_dp_gather: bool = False
     reads_after_attn_tp_gather = False
     fp8_input: Optional[Fp8Input] = None
+    ar_bmg: bool = False
 
     def init_residual(self, hidden_states):
         return hidden_states
 
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
+        if self.ar_bmg and post_residual_addition is None:
+            from sglang.srt.layers.ar86_boundary import try_run
+            fused = try_run(norm, residual, None, self.fp8_input)
+            if fused is not None:
+                return fused
         if residual.shape[0] == 0:
             return residual, residual
         return _norm_quant_kernel(quant_format)(norm, residual, None, None)
@@ -364,6 +370,11 @@ class NormQuantReadout:
     ):
         if not update.is_plain_add:
             return self.read(update.update(hidden_states, residual), norm, quant_format)
+        if self.ar_bmg and post_residual_addition is None:
+            from sglang.srt.layers.ar86_boundary import try_run
+            fused = try_run(norm, hidden_states, residual, self.fp8_input)
+            if fused is not None:
+                return fused
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
         return _norm_quant_kernel(quant_format)(

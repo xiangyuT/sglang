@@ -53,6 +53,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    ParkSessionReqInput,
+    ParkSessionReqOutput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
     ProfileReq,
@@ -125,6 +127,7 @@ _COMMUNICATOR_SPECS = [
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("park_session", ParkSessionReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -1029,6 +1032,12 @@ class TokenizerControlMixin:
             return await future
         finally:
             self.session_futures.pop(obj.session_id, None)
+
+    async def park_session(self: TokenizerManager, obj: ParkSessionReqInput):
+        self.auto_create_handle_loop()
+        results = await self.park_session_communicator(obj)
+        failed = [result for result in results if not result.success]
+        return failed[0] if failed else results[0]
 
     async def close_session(
         self: TokenizerManager,

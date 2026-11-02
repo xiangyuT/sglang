@@ -3112,6 +3112,15 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> nn.Module:
 
         local_model_path = self._prepare_weights(model_config.model_path)
+        if (
+            torch.device(device_config.device).type == "xpu"
+            and model_config.hf_config.model_type == "qwen4_exp"
+        ):
+            from sglang.srt.model_loader.qwen4_gguf_xpu import load_qwen4_gguf_xpu
+
+            return load_qwen4_gguf_xpu(
+                self, model_config, torch.device(device_config.device)
+            )
         gguf_weights_map = self._get_gguf_weights_map(model_config)
         # we can only know if tie word embeddings after mapping weights
         if "lm_head.weight" in get_gguf_extra_tensor_names(

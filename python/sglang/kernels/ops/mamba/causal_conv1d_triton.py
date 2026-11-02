@@ -664,6 +664,7 @@ def _causal_conv1d_update_kernel(
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    FP32_PRODUCTS: tl.constexpr = False,
 ):
     # ruff: noqa: E501
     if USE_GDC:
@@ -908,7 +909,10 @@ def _causal_conv1d_update_kernel(
                             mask=mask_w,
                         )
 
-                acc += matrix_x * matrix_w
+                if FP32_PRODUCTS:
+                    acc += matrix_x.to(tl.float32) * matrix_w.to(tl.float32)
+                else:
+                    acc += matrix_x * matrix_w
 
                 # move to parent for next iteration
                 if _idx_token > 0:
@@ -965,7 +969,10 @@ def _causal_conv1d_update_kernel(
                         x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
                         matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
 
-                acc += matrix_x * matrix_w  # [BLOCK_N]
+                if FP32_PRODUCTS:
+                    acc += matrix_x.to(tl.float32) * matrix_w.to(tl.float32)
+                else:
+                    acc += matrix_x * matrix_w  # [BLOCK_N]
 
             if KERNEL_WIDTH == 2:
                 col0 = matrix_x
@@ -1035,6 +1042,7 @@ def causal_conv1d_update(
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
+    fp32_products: bool = False,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -1224,6 +1232,7 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        FP32_PRODUCTS=fp32_products,
         **pdl_kwargs,
     )
     if unsqueeze:

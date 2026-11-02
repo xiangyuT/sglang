@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from typing import List, Optional
 
@@ -229,11 +230,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Allocate draft KV cache pools (called by scheduler)."""
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.draft_worker.alloc_memory_pool(
-            memory_pool_config=memory_pool_config,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        # Match the GGUF draft's construction/capture placement. Pool geometry
+        # reads the active attention TP width, rather than the model's weights.
+        pool_scope = (
+            draft_tp_context(self.draft_owns_attention)
+            if os.environ.get("SGLANG_XPU_GGUF_TP_EP") == "1"
+            else contextlib.nullcontext()
         )
+        with pool_scope:
+            self.draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
         self.init_token_map()
         self.init_lm_head()
 
@@ -350,9 +359,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None and head is not None:
-                head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
+                if head.device.type == "xpu" and head.dtype == torch.uint8:
+                    # Original GGUF rows are already packed. Select the draft
+                    # vocabulary directly instead of cloning the full head
+                    # before discarding most of those rows.
+                    head = head.index_select(0, self.hot_token_id)
+                else:
+                    head = head.clone()
+                    head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
@@ -360,6 +375,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def _resolve_shared_embed_and_head(self):
         target_runner = self.target_worker.model_runner
+        # A TP1 GGUF draft already loaded the original full vocabulary. A
+        # target vocabulary shard cannot replace that full embedding/head.
+        if os.environ.get("SGLANG_XPU_GGUF_TP_EP") == "1":
+            draft = self.draft_runner.model
+            own_embed, own_head = draft.get_embed_and_head()
+            target_embed, _ = target_runner.model.get_embed_and_head()
+            if (own_embed.dtype == target_embed.dtype == torch.uint8
+                    and own_embed.shape != target_embed.shape):
+                return own_embed, own_head
         return resolve_draft_embed_and_head(
             target_model=target_runner.model,
             draft_model=self.draft_runner.model,
@@ -823,10 +847,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                             i + 1,
                         )
                     else:
-                        topk_index = torch.argmax(
-                            logits_output.next_token_logits, dim=-1, keepdim=True
-                        )
-                        topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                        native_top1 = None
+                        if _is_xpu:
+                            from sglang.kernels.ops.speculative.gguf_mtp_top1 import try_top1
+
+                            native_top1 = try_top1(logits_output.next_token_logits)
+                        if native_top1 is None:
+                            topk_index = torch.argmax(
+                                logits_output.next_token_logits, dim=-1, keepdim=True
+                            )
+                            topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                        else:
+                            topk_p, topk_index = native_top1
                         forward_batch.positions.add_(1)
                 else:
                     probs = renorm_draft_probs(
@@ -1201,10 +1233,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            native_top1 = None
+            if _is_xpu:
+                from sglang.kernels.ops.speculative.gguf_mtp_top1 import try_top1
+
+                native_top1 = try_top1(draft_logits_output.next_token_logits)
+            if native_top1 is None:
+                ret_topk_index = torch.argmax(
+                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                )
+                ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            else:
+                ret_topk_p, ret_topk_index = native_top1
             ret_draft_probs = None
         else:
             probs = renorm_draft_probs(
@@ -1346,6 +1386,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         else get_exec().graph.cuda_graph_bs_decode
                     ),
                 )
+
+        if _is_xpu and (slots := os.environ.get("SGLANG_XPU_GGUF_POST_GRAPH_SLOTS")):
+            from sglang.srt.layers.quantization.gguf_cache_capacity import (
+                grow_model_expert_caches,
+            )
+
+            grow_model_expert_caches(self._target_worker.model_runner.model, int(slots))
 
     def forward_batch_generation(
         self,

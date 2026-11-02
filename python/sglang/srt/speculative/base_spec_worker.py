@@ -279,7 +279,24 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+        pack_mtp = _can_pack_hicache_mtp(spec_algorithm, draft_runners)
+        if pack_mtp and len(draft_pools) == 1:
+            # TP-sharded Qwen target KV and a replicated MTP layer have
+            # different row widths. Use the existing separate draft sidecar;
+            # packing it into target-width rows cannot preserve its bytes.
+            target_pool = target_model_runner.token_to_kv_pool
+            target_pool = getattr(target_pool, "full_kv_pool", target_pool)
+            draft_pool = getattr(draft_pools[0], "full_kv_pool", draft_pools[0])
+            fields = ("head_num", "head_dim", "v_head_dim", "store_dtype")
+            target_row = tuple(getattr(target_pool, f, None) for f in fields)
+            draft_row = tuple(getattr(draft_pool, f, None) for f in fields)
+            target_state = getattr(target_model_runner.req_to_token_pool, "mamba_pool", None)
+            draft_state = getattr(draft_runners[0].req_to_token_pool, "mamba_pool", None)
+            if (None not in target_row and None not in draft_row
+                    and target_row != draft_row
+                    and (draft_state is None or draft_state is target_state)):
+                pack_mtp = False
+        if pack_mtp:
             target_model_runner.mtp_draft_device_pools = draft_pools
             target_mamba_pool = getattr(
                 target_model_runner.req_to_token_pool, "mamba_pool", None

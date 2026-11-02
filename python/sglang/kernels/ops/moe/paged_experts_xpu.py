@@ -7,6 +7,8 @@ buffers and are safe to capture with torch.xpu.XPUGraph.
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 
 @triton.jit
 def _decide_kernel(
@@ -27,46 +29,65 @@ def _decide_kernel(
     BK: tl.constexpr,
     BT: tl.constexpr,
 ):
-    s = tl.arange(0, BK)
     t = tl.arange(0, BT)
-    experts = tl.load(SlotExpert + s, s < K, other=-2)
-    age = tl.load(LastUse + s, s < K, other=2147483647)
-    old_experts = experts
     routed = tl.load(Topk + t, t < T, other=-1).to(tl.int32)
     valid = (t < T) & (routed >= 0) & (routed < E)
+    slots = tl.load(ExpertSlot + routed, valid, other=-1)
     now = tl.load(Step) + 1
-    needed = (
-        tl.sum(((experts[:, None] == routed[None, :]) & valid[None, :]).to(tl.int32), 1)
-        > 0
-    )
-    age = tl.where(needed, now, age)
-    n = 0
-    for i in range(T):
-        expert = tl.load(Topk + i).to(tl.int32)
-        present = tl.sum(((experts == expert) & (s < K)).to(tl.int32), 0) > 0
-        if (expert >= 0) & (expert < E) & ~present:
-            eligible = (s < K) & (age != now)
-            oldest = tl.min(tl.where(eligible, age, 2147483647), 0)
-            victim = tl.min(tl.where(eligible & (age == oldest), s, K), 0)
-            tl.store(Src + n, expert)
-            tl.store(Dst + n, victim)
-            n += 1
-            experts = tl.where(s == victim, expert, experts)
-            age = tl.where(s == victim, now, age)
-    # Clear the old bijection before writing its replacement. One program owns
-    # the whole layer's state; the barrier orders global stores across warps.
-    tl.store(ExpertSlot + old_experts, -1, s < K)
-    tl.debug_barrier()
-    tl.store(ExpertSlot + experts, s, s < K)
-    tl.store(SlotExpert + s, experts, s < K)
-    tl.store(LastUse + s, age, s < K)
-    tl.store(Step, now)
-    tl.store(Count, n)
-    match = (experts[:, None] == routed[None, :]) & (s[:, None] < K)
-    mapped = tl.max(tl.where(match, s[:, None], -1), 0)
-    weights = tl.load(Weights + t, t < T, other=0)
-    tl.store(MappedIds + t, tl.where(valid, mapped, 0), t < T)
-    tl.store(MappedWeights + t, tl.where(valid, weights, 0), t < T)
+    if tl.sum((valid & (slots < 0)).to(tl.int32), 0) == 0:
+        # Most decode calls hit entirely. The inverse map already gives their
+        # slots; update each slot once, including duplicate/padded routes.
+        earlier = (routed[:, None] == routed[None, :]) & (t[:, None] > t[None, :])
+        first = tl.sum((earlier & valid[None, :]).to(tl.int32), 1) == 0
+        tl.store(LastUse + slots, now, valid & first)
+        tl.store(Step, now)
+        tl.store(Count, 0)
+        weights = tl.load(Weights + t, t < T, other=0)
+        tl.store(MappedIds + t, tl.where(valid, slots, 0), t < T)
+        tl.store(MappedWeights + t, tl.where(valid, weights, 0), t < T)
+    else:
+        s = tl.arange(0, BK)
+        t = tl.arange(0, BT)
+        experts = tl.load(SlotExpert + s, s < K, other=-2)
+        age = tl.load(LastUse + s, s < K, other=2147483647)
+        old_experts = experts
+        routed = tl.load(Topk + t, t < T, other=-1).to(tl.int32)
+        valid = (t < T) & (routed >= 0) & (routed < E)
+        now = tl.load(Step) + 1
+        needed = (
+            tl.sum(
+                ((experts[:, None] == routed[None, :]) & valid[None, :]).to(tl.int32), 1
+            )
+            > 0
+        )
+        age = tl.where(needed, now, age)
+        n = 0
+        for i in range(T):
+            expert = tl.load(Topk + i).to(tl.int32)
+            present = tl.sum(((experts == expert) & (s < K)).to(tl.int32), 0) > 0
+            if (expert >= 0) & (expert < E) & ~present:
+                eligible = (s < K) & (age != now)
+                oldest = tl.min(tl.where(eligible, age, 2147483647), 0)
+                victim = tl.min(tl.where(eligible & (age == oldest), s, K), 0)
+                tl.store(Src + n, expert)
+                tl.store(Dst + n, victim)
+                n += 1
+                experts = tl.where(s == victim, expert, experts)
+                age = tl.where(s == victim, now, age)
+        # Clear the old bijection before writing its replacement. One program owns
+        # the whole layer's state; the barrier orders global stores across warps.
+        tl.store(ExpertSlot + old_experts, -1, s < K)
+        tl.debug_barrier()
+        tl.store(ExpertSlot + experts, s, s < K)
+        tl.store(SlotExpert + s, experts, s < K)
+        tl.store(LastUse + s, age, s < K)
+        tl.store(Step, now)
+        tl.store(Count, n)
+        match = (experts[:, None] == routed[None, :]) & (s[:, None] < K)
+        mapped = tl.max(tl.where(match, s[:, None], -1), 0)
+        weights = tl.load(Weights + t, t < T, other=0)
+        tl.store(MappedIds + t, tl.where(valid, mapped, 0), t < T)
+        tl.store(MappedWeights + t, tl.where(valid, weights, 0), t < T)
 
 
 @triton.jit
@@ -101,6 +122,15 @@ def _gather_kernel(
 
 
 def decide(topk, weights, residency, mapped_ids, mapped_weights):
+    if envs.SGLANG_XPU_PAGED_DFLASH.get() and envs.SGLANG_XPU_DFLASH_SYCL_PLANNER.get():
+        from sglang.kernels.ops.moe.xpu_residency_sycl import (
+            can_use_sycl_planner,
+            decide_sycl,
+        )
+
+        if can_use_sycl_planner(topk, weights, residency, mapped_ids, mapped_weights):
+            decide_sycl(topk, weights, residency, mapped_ids, mapped_weights)
+            return
     entries = topk.numel()
     _decide_kernel[(1,)](
         topk,

@@ -73,6 +73,9 @@ class GenerationBatchResult:
     extend_input_len_per_req: Optional[List[int]] = None
     extend_logprob_start_len_per_req: Optional[List[int]] = None
 
+    # Native ordinary FutureMap publication already submitted on forward stream.
+    ar1564_relayed: bool = False
+
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     delay_sample_func: Optional[callable] = None

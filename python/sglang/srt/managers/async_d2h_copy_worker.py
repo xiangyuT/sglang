@@ -76,21 +76,31 @@ class AsyncD2HCopyWorker:
         self._queue.put((src_ready, copy_fn, done))
         return done
 
+    def submit_host_token(self, copy_fn: Callable[[], None], receipt, done=None) -> HostCopyDone:
+        done = HostCopyDone() if done is None else done
+        self._queue.put((None, copy_fn, done, receipt))
+        return done
+
     def _loop(self):
         self.device_module.set_device(self._device_index)
         while True:
             item = self._queue.get()
             if item is None:
                 return
-            src_ready, copy_fn, done = item
+            src_ready, copy_fn, done = item[:3]
+            receipt = item[3] if len(item) == 4 else None
             error = None
             try:
                 # Event-sync, not a stream wait: a stream wait would re-expose
                 # the caller's thread to the blocking copy.
-                src_ready.synchronize()
-                with self.device_module.stream(self.d2h_copy_stream):
+                if receipt is not None:
+                    receipt.wait()
                     copy_fn()
-                self.d2h_copy_stream.synchronize()
+                else:
+                    src_ready.synchronize()
+                    with self.device_module.stream(self.d2h_copy_stream):
+                        copy_fn()
+                    self.d2h_copy_stream.synchronize()
             except Exception as e:
                 logger.exception("AsyncD2HCopyWorker copy failed")
                 error = e

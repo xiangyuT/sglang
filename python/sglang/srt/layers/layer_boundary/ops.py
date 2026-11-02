@@ -226,6 +226,16 @@ def sum_output(
     may_quantize: bool,
 ) -> torch.Tensor:
     """Complete the sum an output owes over ``group`` on the rows it is on."""
+    # This opt-in GGUF model emits FP32 long-row TP/EP partials to avoid
+    # rounding every local contribution to BF16 before the sum. The boundary
+    # owns the one BF16 cast; the general all-reduce dtype contract is intact.
+    if hidden_states.dtype == torch.float32 and hidden_states.device.type == "xpu":
+        from sglang.srt.layers.quantization.gguf_tp_prefill import (
+            enabled, reduce_prefill_partial,
+        )
+
+        if enabled():
+            return reduce_prefill_partial(hidden_states, _sum_group(group))
     parallel = get_parallel()
     if group is SumGroup.ATTN_TP:
         if parallel.attn_tp_size == 1:

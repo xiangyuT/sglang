@@ -304,9 +304,29 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
-                    draft_kv_size = int(
-                        self._cell_size * draft_num_layers / int(num_layers)
-                    )
+                    if kvc.kv_cache_dtype == torch.int8:
+                        # Qwen NEXTN runs a replicated draft: target TP head
+                        # count must not be reused to price its encoded rows.
+                        from sglang.srt.mem_cache.int8_kv_pool import Int8QSAKVCacheMethod
+
+                        draft = kvc.spec_aux_config.draft_model_config
+                        heads = draft.get_num_kv_heads(1)
+                        draft_dtype = get_spec().speculative_draft_kv_cache_dtype
+                        if draft_dtype in (None, "int8"):
+                            draft_kv_size = Int8QSAKVCacheMethod().compute_cell_size(
+                                heads, draft.head_dim, draft_num_layers, 1
+                            )
+                        elif draft_dtype in ("auto", "bf16", "bfloat16"):
+                            draft_kv_size = heads * (draft.head_dim + draft.v_head_dim) * draft_num_layers * draft.dtype.itemsize
+                        else:
+                            raise ValueError("INT8 target QSA supports an INT8 or BF16 NEXTN draft")
+                        draft_kv_size += self._compute_qsa_cell_size(
+                            hf_config=draft.hf_config, num_layers=draft_num_layers
+                        )
+                    else:
+                        draft_kv_size = int(
+                            self._cell_size * draft_num_layers / int(num_layers)
+                        )
                     self._cell_size += draft_kv_size * draft_loc_space_scale
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
@@ -497,6 +517,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     model_config.head_dim,
                     effective_num_layers,
                     kv_size,
+                )
+            elif kv_cache_dtype == torch.int8:
+                from sglang.srt.mem_cache.int8_kv_pool import Int8QSAKVCacheMethod
+                cell_size = Int8QSAKVCacheMethod().compute_cell_size(
+                    n, model_config.head_dim, effective_num_layers, kv_size
                 )
             elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32

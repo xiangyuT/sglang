@@ -17,6 +17,7 @@ from sglang.srt.layers.moe.paged_experts.residency import (
     DeviceResidency,
     LRUPolicy,
     plan_waves,
+    prefill_expert_priorities,
 )
 from sglang.srt.layers.moe.paged_experts.runners import RunnerContract, run_on_slots
 from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
@@ -34,6 +35,7 @@ class EagerExecutor:
         num_experts: int,
         routed_scaling_factor: float,
         device_residency: Optional[DeviceResidency] = None,
+        prefill_priority: bool = False,
     ):
         self.base_method = base_method
         self.store = store
@@ -43,6 +45,7 @@ class EagerExecutor:
         self.routed_scaling_factor = routed_scaling_factor
         # Shared with a DeviceExecutor, whose steps (and graph replays) move it on the GPU.
         self.device_residency = device_residency
+        self.prefill_priority = prefill_priority
 
     def run(self, layer, dispatch_output):
         if self.device_residency is not None:
@@ -62,9 +65,18 @@ class EagerExecutor:
 
         topk_output = dispatch_output.topk_output
         topk_ids = topk_output.topk_ids
-        distinct = [e for e in torch.unique(topk_ids).tolist() if e >= 0]
+        priorities = None
+        if self.prefill_priority and topk_ids.ndim == 2 and topk_ids.shape[1] == 8:
+            # Eager planning already synchronizes routing metadata. Use one
+            # small CPU ID tensor for both the unique set and causal scores.
+            cpu_ids = topk_ids.detach().cpu()
+            distinct = [e for e in torch.unique(cpu_ids).tolist() if e >= 0]
+            if distinct:
+                priorities = prefill_expert_priorities(cpu_ids, self.num_experts)
+        else:
+            distinct = [e for e in torch.unique(topk_ids).tolist() if e >= 0]
         merged = None
-        waves = plan_waves(policy=self.policy, distinct=distinct)
+        waves = plan_waves(policy=self.policy, distinct=distinct, priorities=priorities)
         for wave in waves:
             self.store.page_in(layer=layer, loads=wave.loads)
             # Index E (and -1, which wraps to it) stays -1: padded routing entries are masked.
@@ -81,6 +93,11 @@ class EagerExecutor:
                 slots=slots,
                 merged=merged,
             )
+        if priorities is not None:
+            # Wave count and weight transfers are unchanged for the same
+            # incoming cache. Replace the artificial ID-based prefill ages
+            # with causal priorities before DeviceResidency.store_from().
+            self.policy.prioritize(priorities)
         return StandardCombineInput(
             hidden_states=self.contract.finish(
                 merged=merged,

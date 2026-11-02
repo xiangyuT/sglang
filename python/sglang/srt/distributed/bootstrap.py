@@ -313,6 +313,21 @@ def _init_parallel_groups(
     )
     rank = rank_offset + tp_size * pp_rank + tp_rank
 
+    if backend == "xccl" and os.environ.get("SGLANG_XPU_LOCAL_CCL_BOOTSTRAP") == "1":
+        # SGLang's internal workers are not launched by torchrun/Hydra.  Only
+        # infer a local process layout for this explicitly enabled static,
+        # single-node topology; device ordinals can differ from process ranks.
+        if parallel.nnodes != 1 or is_ep_joiner or is_scale_joiner:
+            raise ValueError("Local XCCL bootstrap requires a static single-node launch")
+        launcher = os.environ.setdefault("CCL_PROCESS_LAUNCHER", "none")
+        if launcher == "none":
+            for name, value in (("CCL_LOCAL_SIZE", world_size), ("CCL_LOCAL_RANK", rank)):
+                actual = os.environ.setdefault(name, str(value))
+                if actual != str(value):
+                    raise ValueError(f"{name}={actual} conflicts with local process layout {value}")
+        logger.info("XCCL bootstrap: launcher=%s local_rank=%s local_size=%s", launcher,
+                    os.environ.get("CCL_LOCAL_RANK"), os.environ.get("CCL_LOCAL_SIZE"))
+
     init_distributed_environment(
         backend=backend,
         world_size=world_size,

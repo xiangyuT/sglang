@@ -314,7 +314,14 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
-        for _, runner in self._select_runners(recv_req.selector):
+        runners = self._select_runners(recv_req.selector)
+        # Preflight every selected runner before restoring any weight. Return a
+        # normal rejected response, leaving the session and graph caches intact.
+        for _, runner in runners:
+            error = runner.weight_updater.derived_weight_cache_error()
+            if error is not None:
+                return BeginWeightUpdateReqOutput(success=False, message=error)
+        for _, runner in runners:
             runner.weight_updater.begin_weight_update()
         self._session = _WeightUpdateSession(selector=recv_req.selector)
         torch.distributed.barrier(group=self.tp_cpu_group)

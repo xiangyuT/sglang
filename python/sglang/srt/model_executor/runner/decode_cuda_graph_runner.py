@@ -709,6 +709,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        # Padded graphs bypass backend.can_run below. Reject score consumers
+        # before either replay route can select a greedy-only score carrier.
+        if (os.environ.get("SGLANG_XPU_GGUF_TP_GREEDY_GATHER") == "1"
+                and getattr(self.backend, "_native_gguf", False)
+                and forward_batch.forward_mode.is_target_verify()):
+            from sglang.srt.layers.ar449_head import eligibility
+
+            if not eligibility(forward_batch, target_verify=True, max_batch=8)[0]:
+                return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
@@ -1346,7 +1356,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.backend.capture_one(
                     shape_key,
                     run_once,
-                    capture_inputs=None,
+                    capture_inputs=(
+                        forward_batch if self.device_module is torch.xpu else None
+                    ),
                     post_warmup_hook=post_warmup_hook,
                 )
 

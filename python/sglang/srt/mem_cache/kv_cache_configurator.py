@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -425,12 +426,36 @@ class KVCacheConfigurator:
         return quant_method
 
     def _build_mha_quant_method(self, *, num_layers: int):
+        if self.kv_cache_dtype == torch.int8:
+            from sglang.srt.mem_cache.int8_kv_pool import Int8QSAKVCacheMethod
+            from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+
+            if (not current_platform.is_xpu()
+                    or parse_qsa_profile(self.model_config.hf_config) is None
+                    or self.mambaish_config is None):
+                raise ValueError("INT8 KV currently supports only native XPU hybrid QSA")
+            parallel = get_parallel()
+            if (parallel.attn_dcp_size != 1 or parallel.attn_cp_size != 1
+                    or self.pp_size != 1 or self.use_mla_backend):
+                raise ValueError("INT8 QSA KV currently supports TP/EP without CP, DCP, PP or MLA")
+            if set(attention_backends()) - {None, "intel_xpu"}:
+                raise ValueError("INT8 QSA KV requires the intel_xpu attention backend")
+            memory = get_memory()
+            if (memory.enable_unified_memory or memory.enable_page_major_kv_layout
+                    or memory.enable_hisparse or get_parallel().enable_kv_cache_sharding
+                    or envs.SGLANG_USE_HND_KVCACHE.get()):
+                raise ValueError("INT8 QSA KV requires the ordinary NHD pool; HiCache is supported")
+            return Int8QSAKVCacheMethod()
         if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
             return get_kv_cache_quant_method("cpu_fp8_e4m3")
         return self._build_fp4_quant_method(num_layers=num_layers)
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
+        if self.kv_cache_dtype == torch.int8:
+            # Validate before alternate/unified pool factories can bypass the
+            # ordinary MHA builder. This creates no buffers or device work.
+            self._build_mha_quant_method(num_layers=0)
         if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
             if self.use_mla_backend:
                 raise ValueError("CPU FP8 KV cache is only supported for MHA.")
@@ -2506,6 +2531,9 @@ class KVCacheConfigurator:
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
+        if self.kv_cache_dtype == torch.int8:
+            from sglang.srt.mem_cache.int8_kv_pool import Int8QSATokenToKVPool
+            return Int8QSATokenToKVPool
         if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
             return dsa_pool_class
         if _is_npu:
@@ -3111,6 +3139,29 @@ class KVCacheConfigurator:
                     * (capped_reqs + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
+                params = config.mamba2_cache_params
+                shape = params.shape.temporal
+                if (
+                    os.environ.get("SGLANG_XPU_GGUF_GDN_SKIP_CHECKPOINTS") == "1"
+                    and os.environ.get("SGLANG_XPU_GGUF_GDN_SYCL") == "1"
+                    and torch.device(self.device).type == "xpu"
+                    and get_model().quantization == "gguf"
+                    and len(all_mamba_layers) == 36 and self.pp_size == 1
+                    and tuple(shape) in ((48, 128, 128), (24, 128, 128), (12, 128, 128))
+                    and params.dtype.temporal == torch.float32
+                    and 1 <= get_schedule().max_running_requests <= 8
+                    and get_spec().speculative_num_draft_tokens == 4
+                ):
+                    from sglang.kernels.ops.attention.gguf_gdn_sycl import scratch_bytes
+
+                    # MambaPool skips SSM checkpoints on this guarded path.
+                    # Keep its original conv rollback reserve and charge the
+                    # actual pool-owned delta/output buffers instead.
+                    conv_bytes = sum(math.prod(s) for s in params.shape.conv) * params.dtype.conv.itemsize
+                    intermediate_size = (
+                        conv_bytes * len(all_mamba_layers) * (capped_reqs + 1) * 4
+                        + scratch_bytes(shape[0], get_schedule().max_running_requests)
+                    )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
             get_memory().disable_radix_cache

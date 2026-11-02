@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from copy import copy
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
@@ -710,6 +711,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 logical_positions=ring_logical_positions,
                 compress_ratio=self.compress_ratio,
                 is_extend=group_member_rows is not None,
+                ring_size=getattr(self.token_to_kv_pool, "qsa_pending_ring_size", self.compress_ratio),
             )
             if write_locs.numel():
                 if group_member_rows is not None:
@@ -727,6 +729,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                         group_end_positions=group_positions.long(),
                         sequence_ids=group_sequence_ids.long(),
                         compress_ratio=self.compress_ratio,
+                        ring_size=getattr(self.token_to_kv_pool, "qsa_pending_ring_size", self.compress_ratio),
                     )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
@@ -750,6 +753,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             defer_block_expansion=(
                 self._can_defer_block_expansion(forward_batch.forward_mode)
                 and decode_logical_positions is not None
+            ),
+            max_query_rows_per_request=(
+                int(forward_batch.spec_info.draft_token_num)
+                if forward_batch.forward_mode.is_target_verify()
+                else int(getattr(forward_batch.spec_info, "num_tokens_per_req", 0) or
+                         token_to_batch_idx.numel())
+                if forward_batch.forward_mode.is_draft_extend_v2()
+                else 1
             ),
         )
         return QwenSparseAttnMetadata(
@@ -942,6 +953,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             block_topk=pool.qsa_block_topk,
             req_pool_indices=self._graph_row_req_pool_indices[:metadata_rows],
             is_cuda_graph=True,
+            max_query_rows_per_request=(metadata_rows // max(bs, 1)),
             graph_write_locs=self._graph_write_locs[:metadata_rows],
             graph_compressed_page_table=self._graph_compressed_page_table[
                 :metadata_rows
@@ -980,6 +992,23 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> None:
         self._require_chain_speculation(forward_mode, spec_info)
         metadata = self._cuda_graph_metadata[(forward_mode, bs)]
+        if seq_lens.device.type == "xpu":
+            from sglang.kernels.ops.attention.xpu_qsa_sycl import (
+                try_refresh_graph_metadata,
+            )
+
+            if try_refresh_graph_metadata(
+                self,
+                metadata,
+                bs,
+                req_pool_indices,
+                seq_lens,
+                forward_mode,
+                spec_info,
+                num_padding,
+            ):
+                self.forward_metadata = metadata
+                return
         # Compressed addressing is arithmetic over req_to_token; pure reads below.
         if self._can_replay_with_gpu_kernels(metadata, seq_lens):
             self._replay_cuda_graph_metadata_gpu(
@@ -1149,6 +1178,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 logical_positions=current_positions,
                 compress_ratio=ratio,
                 is_extend=False,
+                ring_size=getattr(pool, "qsa_pending_ring_size", ratio),
             )
         )
         metadata.graph_ring_group_locs.copy_(
@@ -1157,6 +1187,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 group_end_positions=current_positions,
                 sequence_ids=metadata.token_to_batch_idx.long(),
                 compress_ratio=ratio,
+                ring_size=getattr(pool, "qsa_pending_ring_size", ratio),
             ).to(torch.int32)
         )
 
@@ -1300,21 +1331,30 @@ class QwenSparseAttnBackend(AttentionBackend):
         assert self.forward_metadata is not None
         return self.forward_metadata
 
-    @staticmethod
     def _logical_to_physical(
-        logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
+        self, logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
     ) -> torch.Tensor:
         sequence_ids = metadata.token_to_batch_idx.long()
         if sequence_ids.numel() != logical_indices.shape[0]:
             raise ValueError("QSA top-k rows do not match query rows")
+        slot_table = metadata.token_slot_table
+        slot_rows = sequence_ids
+        if metadata.is_cuda_graph:
+            # CUDA's sparse kernels bypass the one-column dummy table in
+            # captured metadata. The XPU reference path must instead gather
+            # from the real request table, using replay-updated request IDs.
+            if self.req_to_token is None or metadata.row_req_pool_indices is None:
+                raise RuntimeError("QSA graph replay requires the request slot table")
+            slot_table = self.req_to_token
+            slot_rows = metadata.row_req_pool_indices.index_select(
+                0, sequence_ids
+            ).long()
         row_lengths = metadata.sequence_lengths.to(torch.int32).index_select(
             0, sequence_ids
         )
         valid = (logical_indices >= 0) & (logical_indices < row_lengths.unsqueeze(1))
-        safe = logical_indices.clamp(
-            min=0, max=metadata.token_slot_table.shape[1] - 1
-        ).long()
-        slots = metadata.token_slot_table[sequence_ids[:, None], safe]
+        safe = logical_indices.clamp(min=0, max=slot_table.shape[1] - 1).long()
+        slots = slot_table[slot_rows[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
     @staticmethod
@@ -1471,7 +1511,24 @@ class QwenSparseAttnBackend(AttentionBackend):
             return self._pad_extend_output(output, num_output_rows)
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
-            slots = self._logical_to_physical(topk_indices, metadata)
+            attention_indices = topk_indices
+            if (q.device.type == "xpu" and q.shape[0] > 4
+                    and os.environ.get("SGLANG_XPU_QSA_PREFILL_TRIM_PADDED") == "1"
+                    and not torch.xpu.is_current_stream_capturing()
+                    and forward_batch.batch_size == 1):
+                lengths = forward_batch.seq_lens_cpu
+                # Fresh full-prefix EXTEND only. A cached prefix, padded rows,
+                # missing CPU metadata or speculative replay retains all columns.
+                if (isinstance(lengths, torch.Tensor) and lengths.device.type == "cpu"
+                        and lengths.numel() == 1 and int(lengths[0]) == q.shape[0]):
+                    from sglang.kernels.ops.attention.xpu_qsa_sycl import (
+                        trim_compacted_prefill_indices,
+                    )
+
+                    attention_indices = trim_compacted_prefill_indices(
+                        topk_indices, q.shape[0]
+                    )
+            slots = self._logical_to_physical(attention_indices, metadata)
             pool = self.token_to_kv_pool
             output = qsa_sparse_attention(
                 q,

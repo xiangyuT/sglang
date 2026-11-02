@@ -1113,6 +1113,14 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
         if checkpointed:
+            # A short turn may finish before its next recurrent checkpoint.
+            # checkpoint_into_tree then inserts nothing, but the previously
+            # matched/stashed prefix is still reusable and belongs to the session.
+            if self.enable_session_radix_cache and req.last_node is not None:
+                from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+                if not isinstance(req.finished_reason, FINISH_ABORT):
+                    self.session_refs.register_session_ref(req, leaf=req.last_node)
             return
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(req, is_finished=True)
@@ -3727,6 +3735,61 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def ensure_session_generation(self, session_id: str) -> int:
         return self.session_refs.ensure_session_generation(session_id)
+
+    def park_radix_session(self, session_id: str) -> dict:
+        """Back up and demote an idle session through the existing L2 protocol.
+
+        The scheduler rejects in-flight requests before calling. Keep shared or
+        locked paths on device, never delete an unbacked victim, and retain the
+        session references so an ordinary next turn can load the same prefix.
+        """
+        if not self.enable_session_radix_cache or self.cache_controller is None:
+            raise ValueError("Session parking requires session radix cache and HiCache")
+        if self.linker is not None or self.buffer_pipeline is not None:
+            raise ValueError("Session parking requires the host L2 cache mode")
+        full = self.tree_core.components_by_type[BASE_COMPONENT_TYPE]
+        leaves = full._session_leaves.get(session_id, ())
+        if not leaves:
+            raise ValueError("No reusable radix prefix is registered for this session")
+        root = self.tree_core.root_node
+
+        def path(leaf):
+            while leaf is not root:
+                yield leaf
+                leaf = leaf.parent
+
+        nodes = {node for leaf in leaves for node in path(leaf)}
+        shared = {node for other, other_leaves in full._session_leaves.items()
+                  if other != session_id for leaf in other_leaves for node in path(leaf)}
+        depth = {node: sum(1 for _ in path(node)) for node in nodes}
+        ordered = sorted(nodes, key=lambda node: (depth[node], node.id))
+        # Complete parent-first backups before releasing ANY device data. Each
+        # ack covers Full KV, sparse-indexer sidecars, Mamba and PLE siblings.
+        for node in ordered:
+            if node.evicted:
+                continue
+            needs_backup = not node.backuped or any(comp.needs_incremental_backup(node) for comp in self.tree_core.components)
+            if needs_backup and not self.backup_node_for_write_back(node.id):
+                raise RuntimeError("Insufficient host cache capacity; device prefix retained")
+        tracker = {ct: 0 for ct in self.tree_components}
+        for node in reversed(ordered):
+            if (node.evicted or node in shared or
+                    any(cd.lock_ref > 0 for cd in node.component_data) or
+                    node.write_through_pending_id is not None or
+                    node.load_back_pending_id is not None or
+                    not self.tree_core._is_device_leaf(node)):
+                continue
+            if not node.backuped or any(
+                cd.value is not None and cd.host_value is None
+                for cd in node.component_data
+            ):
+                raise RuntimeError("Incomplete host checkpoint; device prefix retained")
+            self._demote(node.id, tracker)
+        return dict(
+            device_tokens_released=tracker[BASE_COMPONENT_TYPE],
+            mamba_states_released=tracker.get(ComponentType.MAMBA, 0),
+            retained_device_tokens=sum(len(node.component_data[BASE_COMPONENT_TYPE].value) for node in nodes if not node.evicted),
+        )
 
     def release_radix_session(self, session_id: str) -> int:
         return self.session_refs.release_radix_session(session_id)

@@ -71,6 +71,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
     get_attn_backend,
     get_req_to_token_pool,
 )
@@ -126,21 +128,29 @@ def _ple_table_is_fp8(
 
 
 @eager_on_graph(True)
-def _breakable_qsa_indexer(layer, hidden_states, positions):
+def _breakable_qsa_indexer(layer, hidden_states, positions, attn_backend):
     # Read the live batch on every replay of this eager break.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    topk = layer._compute_qsa_topk_indices_eager(
-        hidden_states=hidden_states,
-        positions=positions,
-        forward_batch=forward_batch,
-        use_host_prefill_lengths=True,
-    )
+    # A multi-step draft graph captures different attention backends per step.
+    # Keep that control context while reading request metadata from the live
+    # batch, rather than inheriting the caller's outer replay context.
+    with forward_context(ForwardContext(attn_backend=attn_backend)):
+        topk = layer._compute_qsa_topk_indices_eager(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            use_host_prefill_lengths=True,
+        )
     # Separate buffers cost up to buckets * max_tokens * block_topk * 4B * QSA layers.
     # For 8 buckets / 16K tokens / topk512 / 12 layers: 3 GiB -> 384 MiB shared.
-    bridge = layer._qsa_prefill_topk_bridge
+    # Draft decode appends a speculation tail to the draft-extend selection.
+    # Their widths differ even on the same layer, so one shared bridge would
+    # be replaced by the last captured phase and break the other phase.
+    width = topk.shape[1]
+    bridge = layer._qsa_prefill_topk_bridges.get(width)
     if bridge is None or bridge.shape[0] < hidden_states.shape[0]:
         bridge = topk.new_empty((hidden_states.shape[0], topk.shape[1]))
-        layer._qsa_prefill_topk_bridge = bridge
+        layer._qsa_prefill_topk_bridges[width] = bridge
     output = bridge[: hidden_states.shape[0]]
     output.fill_(0)
     output[: topk.shape[0]].copy_(topk)
@@ -592,14 +602,27 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.eos_token_id = int(config.eos_token_id)
         self.enable_ple_fusion = envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
 
-        self.register_buffer(
-            "layer_multipliers",
-            self._build_layer_multipliers(self.ngram_size),
-            persistent=True,
+        gguf_path = getattr(config, "gguf_model_path", None)
+        multipliers = (
+            torch.tensor(config.gguf_ple_layer_multipliers, dtype=torch.long)
+            if gguf_path
+            else self._build_layer_multipliers(self.ngram_size)
         )
+        self.register_buffer("layer_multipliers", multipliers, persistent=True)
         head_vocab_sizes, head_offsets, total_vocab_size = (
             self._build_head_vocab_and_offsets()
         )
+        if gguf_path:
+            head_vocab_sizes = config.gguf_ple_head_vocab_sizes
+            head_offsets = config.gguf_ple_head_offsets
+            if (
+                len(head_vocab_sizes) != self.ngram_heads
+                or len(head_offsets) != self.ngram_heads
+            ):
+                raise ValueError("GGUF PLE hash metadata does not match its head count")
+            total_vocab_size = max(
+                s + o for s, o in zip(head_vocab_sizes, head_offsets)
+            )
         self.register_buffer(
             "ngram_heads_vocab_sizes",
             torch.tensor(head_vocab_sizes, dtype=torch.long),
@@ -622,6 +645,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
         offload_embedding = bool(config.ple_offload_embedding)
+        if gguf_path:
+            native_tp_ep = (
+                get_bool_env_var("SGLANG_XPU_GGUF_TP_EP")
+                and get_parallel().tp_size == get_parallel().moe_ep_size
+                and get_parallel().tp_size in (2, 4)
+            )
+            if (get_parallel().tp_size != 1 and not native_tp_ep) or self.gather_dp_tokens:
+                raise ValueError(
+                    "Compressed GGUF PLE currently requires a single device"
+                )
+            from sglang.srt.models.qwen4_exp_gguf_ple import Qwen4ExpGGUFEmbedding
+
+            self.ngram_embedding = Qwen4ExpGGUFEmbedding(config)
+            return
         # Offload only needs this embedding's metadata: build it on meta so the
         # shard is never allocated on the device.
         with torch.device("meta") if offload_embedding else nullcontext():
@@ -1104,8 +1141,11 @@ class Qwen4ExpPLELayer(nn.Module):
             bias=False,
         )
         nn.init.zeros_(self.conv1d.weight)
+        self._prefetch_api = torch.get_device_module(self.conv1d.weight.device)
         self._prefetch_stream = (
-            torch.cuda.Stream() if config.ple_offload_embedding else None
+            self._prefetch_api.Stream()
+            if config.ple_offload_embedding and self.conv1d.weight.device.type != "cpu"
+            else None
         )
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
@@ -1312,9 +1352,9 @@ class Qwen4ExpPLELayer(nn.Module):
         offloaded_embedding = self.ple_embedding.ngram_embedding
 
         stream = self._prefetch_stream
-        stream.wait_stream(torch.cuda.current_stream())
+        stream.wait_stream(self._prefetch_api.current_stream())
         lookup_ids.record_stream(stream)
-        with torch.cuda.stream(stream):
+        with self._prefetch_api.stream(stream):
             offloaded_embedding.gather(lookup_ids, out=output_view)
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
 
@@ -1324,7 +1364,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if self._prefetch_state is None:
             raise RuntimeError("PLE prefetch state is missing")
         embeddings, semantic_tokens, physical_tokens = self._prefetch_state
-        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        self._prefetch_api.current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
         embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
         embeddings = self.ple_embedding._finish_embedding_lookup(
@@ -1606,12 +1646,18 @@ class Qwen4ExpLayerExtensionMixin:
     @contextmanager
     def hc_norms(self, normalized_input, next_norm):
         norms = _HCNorms(normalized_input, next_norm)
+        parallel = get_parallel()
+        ep_preserves_rows = parallel.moe_ep_size == 1
+        if not ep_preserves_rows:
+            from sglang.srt.layers.quantization.gguf_ep import hc_norm_reuse_enabled
+
+            ep_preserves_rows = hc_norm_reuse_enabled(self, parallel)
         # A prepared norm can only follow its residual without row movement.
         self._hc_norms = (
             norms
-            if get_parallel().attn_dp_size == 1
-            and get_parallel().attn_cp_size == 1
-            and get_parallel().moe_ep_size == 1
+            if parallel.attn_dp_size == 1
+            and parallel.attn_cp_size == 1
+            and ep_preserves_rows
             and not get_attn_tp_context().input_scattered
             and get_moe_a2a_backend().is_none()
             else None
@@ -1674,7 +1720,7 @@ class Qwen4ExpLayerExtensionMixin:
 
     def _add_ple_embedding(self, residual: torch.Tensor) -> torch.Tensor:
         forward_batch, ple_batch = self._ple_forward_batch, self._ple_batch
-        if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
+        if isinstance(ple_batch, _BreakablePLEBatch):
             output = torch.empty_like(residual)
             _breakable_ple_forward(
                 ple=self.ple, hidden_states=residual, batch=ple_batch, output=output
@@ -1728,7 +1774,9 @@ class Qwen4ExpLayerExtensionMixin:
             return self.ffn_boundary.complete_now(
                 hidden_states, forward_batch, already_reduced=True
             )
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+        from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
+
+        with set_forward_batch(forward_batch), self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
                     hidden_states,
@@ -1811,7 +1859,7 @@ class Qwen4ExpAttentionDecoderLayer(
         from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
         self.is_qsa = is_qwen_qsa(config)
-        self._qsa_prefill_topk_bridge = None
+        self._qsa_prefill_topk_bridges = {}
         if self.is_qsa:
             self.indexer = build_qsa_indexer(
                 config=config,
@@ -1828,9 +1876,56 @@ class Qwen4ExpAttentionDecoderLayer(
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
+        if (
+            is_in_breakable_cuda_graph()
+            and hidden_states.device.type == "xpu"
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+        ):
+            from sglang.kernels.ops.attention.xpu_qsa_sycl import (
+                can_capture_mtp_indexer,
+                can_capture_verify_indexer,
+            )
+            from sglang.srt.layers.attention.qsa.glue import (
+                get_qsa_indexer_metadata,
+                resolve_qsa_sparse_backend,
+            )
+
+            metadata = get_qsa_indexer_metadata(
+                get_attn_backend(), self.layer_id, forward_batch
+            )
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or can_capture_mtp_indexer(
+                    resolve_qsa_sparse_backend(get_attn_backend()), forward_batch
+                )
+            ) and can_capture_verify_indexer(
+                self.indexer, hidden_states, positions, metadata
+            ):
+                return self._compute_qsa_topk_indices_eager(
+                    hidden_states, positions, forward_batch
+                )
+        if is_in_breakable_cuda_graph() and (
+            forward_batch.forward_mode.is_extend()
+            or (
+                hidden_states.device.type == "xpu"
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                )
+            )
+        ):
+            # The XPU top-k fallback reads per-row lengths on the host. Keep
+            # that work at a live-batch eager boundary during decode and MTP
+            # draft-extend replay.
             return _breakable_qsa_indexer(
-                layer=self, hidden_states=hidden_states, positions=positions
+                layer=self,
+                hidden_states=hidden_states,
+                positions=positions,
+                attn_backend=get_attn_backend(),
             )
         return self._compute_qsa_topk_indices_eager(
             hidden_states=hidden_states,
@@ -1863,7 +1958,7 @@ class Qwen4ExpAttentionDecoderLayer(
         indexer_metadata = get_qsa_indexer_metadata(
             backend, self.layer_id, forward_batch
         )
-        if use_host_prefill_lengths:
+        if use_host_prefill_lengths and forward_batch.seq_lens_cpu is not None:
             indexer_metadata = msgspec.structs.replace(
                 indexer_metadata,
                 prefill_sequence_lengths_cpu=tuple(
@@ -1990,6 +2085,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
             use_attn_tp_group=is_dp_attention_enabled(),
+            quant_config=self._gguf_embedding_quant_config,
+            prefix=self._gguf_embedding_prefix,
         )
 
     def __init__(
@@ -1999,6 +2096,17 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         prefix: str = "",
         is_nextn: bool = False,
     ) -> None:
+        # The base model calls _build_embed_tokens before constructing layers.
+        # Its usual embedding stays unquantized; the native GGUF loader opts
+        # into retaining IQ4_XS rows through this embedding quantization method.
+        self._gguf_embedding_quant_config = (
+            quant_config
+            if getattr(quant_config, "compressed_iq4_head", False)
+            else None
+        )
+        self._gguf_embedding_prefix = (
+            f"{prefix}.embed_tokens" if prefix else "embed_tokens"
+        )
         super().__init__(config, quant_config, prefix, is_nextn)
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
@@ -2057,10 +2165,32 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 hidden_states, positions, forward_batch
             )
 
+        capture_gguf_ple = (
+            self.has_ple
+            and get_bool_env_var("SGLANG_XPU_GGUF_PLE_GRAPH")
+            and input_ids.device.type == "xpu"
+            and forward_batch.forward_mode.is_target_verify()
+            and forward_batch._original_forward_mode is None
+            and 1 <= forward_batch.batch_size <= 8
+            and input_ids.numel() == forward_batch.batch_size * 4
+            and not shards_rows
+            and all(
+                layer.ple is None
+                or getattr(layer.ple.ple_embedding.ngram_embedding, "_gpu_gather", None) is not None
+                for layer in self.layers[self.start_layer : self.end_layer]
+            )
+        )
         breakable_ple = (
             self.has_ple
+            and not capture_gguf_ple
             and is_in_breakable_cuda_graph()
-            and forward_batch.forward_mode.is_extend()
+            and (
+                forward_batch.forward_mode.is_extend()
+                or (
+                    input_ids.device.type == "xpu"
+                    and forward_batch.forward_mode.is_decode()
+                )
+            )
         )
         ple_batch = None
         if breakable_ple:
@@ -2237,13 +2367,16 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        output = super().forward(
-            input_ids=input_ids,
-            positions=positions,
-            forward_batch=forward_batch,
-            get_embedding=get_embedding,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
+
+        with set_forward_batch(forward_batch):
+            output = super().forward(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                get_embedding=get_embedding,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
         hc_hidden_states = self.model.last_hc_hidden_states
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
             output.hidden_states = hc_hidden_states

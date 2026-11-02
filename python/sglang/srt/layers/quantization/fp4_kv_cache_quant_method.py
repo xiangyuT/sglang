@@ -58,6 +58,8 @@ class KVCacheAttentionAccessKind(str, Enum):
     DEQUANT_WORKSPACE = "dequant_workspace"
     # Attention backend directly consumes FP4 KV cache storage and scales.
     NATIVE_FP4 = "native_fp4"
+    # Native QSA consumes signed INT8 payload and inline FP16 block scales.
+    NATIVE_INT8 = "native_int8"
 
 
 @dataclass(frozen=True)

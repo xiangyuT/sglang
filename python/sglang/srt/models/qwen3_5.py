@@ -69,8 +69,10 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 
 # Layers - Others
+from sglang.srt.layers.ar86_boundary import shared_readout as ar86_shared_readout, supports_projection as ar86_supports_projection, ENABLED as ar86_enabled
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_QUANT_READOUT,
+    NORM_READOUT,
     Fp8Input,
     NormQuantReadout,
 )
@@ -251,6 +253,10 @@ def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
         from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
         return CuteDSLFusion()
+    if (os.environ.get('CODEX_AR1502_PREGATE')=='1'and _is_xpu and not is_nextn
+            and _qwen3_5_is_moe(config)and config.hidden_size==2048):
+        from sglang.srt.layers.ar1502_pregate import GateFusion
+        return GateFusion()
     return None
 
 
@@ -261,7 +267,7 @@ def _qwen3_5_is_moe(config: Qwen3_5TextConfig) -> bool:
 
 
 def _qwen3_5_stage_facts(
-    config: Qwen3_5TextConfig, layer_id: int, *, attn_read=NORM_QUANT_READOUT
+    config: Qwen3_5TextConfig, layer_id: int, *, attn_read=NORM_QUANT_READOUT, ffn_read=NORM_READOUT
 ):
     """The attention and FFN stages a Qwen3.5 layer of either kind declares:
     the model's shared declaration function (see make_layers), which the
@@ -269,13 +275,14 @@ def _qwen3_5_stage_facts(
     read, which declares what the plain one does and also hands on the
     quantized input its projection takes."""
     sparse = _qwen3_5_is_moe(config)
-    return (
-        declare_attn(read=attn_read),
-        declare_ffn(sparse=sparse, next_layer_sparse=sparse),
+    from sglang.srt.layers.ar1532_outnorm import declarations as projection_declarations
+    return projection_declarations(
+        config, declare_attn(read=attn_read),
+        declare_ffn(sparse=sparse, next_layer_sparse=sparse, read=ffn_read),
     )
 
 
-if _is_cuda:
+if _is_cuda or _is_xpu:
     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
         fused_qk_gemma_rmsnorm_rope_gate,
     )
@@ -363,6 +370,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self._xpu_gguf_decode_norm = (
+            _is_xpu and quant_config is not None and quant_config.get_name() == "gguf"
+        )
         parallel_group = linear_attn_parallel_group()
         self.attn_tp_rank, self.attn_tp_size = resolve_linear_parallel_group(
             parallel_group
@@ -808,7 +818,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         )
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def _forward_input_proj(self, hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], forward_batch=None):
+        if ar86_enabled and isinstance(hidden_states, tuple):
+            if not _is_xpu or len(hidden_states) != 3 or self.alt_stream is not None:
+                raise ValueError("Unsupported AR86 GDN tuple projection")
+            hs_bf16 = hidden_states[0]
+            hs_qkvz = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvz)
+            from sglang.srt.layers.ar646_input import try_run as try_input646
+            projected_states_qkvz = try_input646(self.in_proj_qkvz, hs_qkvz, forward_batch)
+            if projected_states_qkvz is None:
+                projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
+            projected_states_ba, _ = self.in_proj_ba(hs_bf16)
+            return projected_states_qkvz, projected_states_ba
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
@@ -945,13 +966,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         projected_states_qkvz: torch.Tensor,
         projected_states_ba: torch.Tensor,
         forward_batch: ForwardBatch,
+        preconv=None,
     ):
-        core_attn_out, z = backend.forward_fused_gdn(
-            self.attn,
-            forward_batch,
-            projected_states_qkvz,
-            projected_states_ba,
-        )
+        if preconv is None:
+            core_attn_out, z = backend.forward_fused_gdn(
+                self.attn, forward_batch, projected_states_qkvz, projected_states_ba
+            )
+        else:
+            core_attn_out, z = backend.forward_fused_gdn(
+                self.attn, forward_batch, projected_states_qkvz, projected_states_ba,
+                preconv=preconv,
+            )
 
         assert core_attn_out is not None, "XPU backend must support fused GDN"
 
@@ -966,7 +991,46 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
+        if forward_batch.forward_mode.is_decode():
+            from sglang.kernels.ops.attention.xpu_tp_attention_sycl import (
+                try_gdn_norm_quant,
+            )
+
+            tp_quant = try_gdn_norm_quant(
+                core_attn_out, z, self.norm, self.out_proj
+            )
+            if tp_quant is not None:
+                return self.out_proj(tp_quant)[0]
+
+            from sglang.srt.layers.ar482_norm import try_run as try_ar_norm_quant
+
+            quant = try_ar_norm_quant(
+                core_attn_out, z, self.norm, self.out_proj, forward_batch
+            )
+            if quant is not None:
+                from sglang.srt.layers.ar1532_outnorm import try_defer as defer_projection
+                deferred = defer_projection(self.out_proj, quant, forward_batch)
+                if deferred is not None:
+                    return deferred
+                return self.out_proj(quant)[0]
+
+        if self._xpu_gguf_decode_norm and forward_batch.forward_mode.is_decode():
+            # Preserve the ordinary one-token RMSNorm reduction. Batch-dependent
+            # row packing can perturb BF16 bits that recurrent layers amplify.
+            core_attn_out, _, _ = _layer_norm_fwd(
+                core_attn_out,
+                self.norm.weight,
+                None,
+                self.norm.eps,
+                z=z,
+                group_size=self.norm.group_size,
+                norm_before_gate=self.norm.norm_before_gate,
+                is_rms_norm=True,
+                activation=self.norm.activation,
+                rows_per_block=1,
+            )
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
@@ -984,8 +1048,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        from sglang.srt.layers.ar1776_inputconv import try_run as try_input_conv
+        fused = try_input_conv(self, hidden_states, forward_batch)
+        if fused is not None:
+            backend, projected_states_qkvz, projected_states_ba, preconv = fused
+            return self._forward_xpu(
+                backend, projected_states_qkvz, projected_states_ba, forward_batch,
+                preconv=preconv,
+            )
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
+            hidden_states, forward_batch
         )
 
         if _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu":
@@ -998,7 +1070,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     backend, projected_states_qkvz, projected_states_ba, forward_batch
                 )
 
-        use_strided_prefill_z = False
+        gguf_verify_views = None
+        if _is_xpu and forward_batch.forward_mode.is_target_verify():
+            from sglang.kernels.ops.attention.gguf_gdn_views import try_verify_views
+
+            gguf_verify_views = try_verify_views(
+                projected_states_qkvz, projected_states_ba,
+                is_verify=True,
+                key_heads=self.num_k_heads // self.attn_tp_size,
+                value_heads=self.num_v_heads // self.attn_tp_size,
+                head_dim=self.head_v_dim,
+            )
+        use_strided_prefill_z = gguf_verify_views is not None
         packed_verify = False
         if forward_batch.forward_mode.is_target_verify():
             from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -1008,6 +1091,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             packed_verify = getattr(backend, "supports_packed_verify", False)
         use_fused_proj_conv = (
             _gdn_decode_fused_proj_conv
+            and gguf_verify_views is None
             and (forward_batch.forward_mode.is_decode() or packed_verify)
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)
@@ -1015,7 +1099,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         use_fused_contiguous_unpack = (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
         )
-        if use_fused_proj_conv:
+        if gguf_verify_views is not None:
+            mixed_qkv, z, b, a = gguf_verify_views
+        elif use_fused_proj_conv:
             # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
             # it replaces these temporary B/A placeholders before recurrence.
             mixed_qkv = (projected_states_qkvz, projected_states_ba)
@@ -1105,6 +1191,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             return self.out_proj(fp8)[0]
 
+        if _is_xpu and forward_batch.forward_mode.is_target_verify():
+            from sglang.kernels.ops.attention.dflash_gdn_norm_quant_sycl import (
+                can_fuse_gdn_norm_quant,
+                gdn_norm_quant,
+            )
+
+            if can_fuse_gdn_norm_quant(core_attn_out, z, self.norm, self.out_proj):
+                quant = gdn_norm_quant(
+                    core_attn_out, z, self.norm.weight, self.norm.eps
+                )
+                return self.out_proj(quant)[0]
+
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
@@ -1186,8 +1284,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 config,
                 layer_id,
                 attn_read=NormQuantReadout(
-                    fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
+                    fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None,
+                    ar_bmg=ar86_supports_projection(self.linear_attn.in_proj_qkvz),
                 ),
+                ffn_read=ar86_shared_readout(self.mlp),
             )
             self.attn_boundary, self.ffn_boundary = append_stages(
                 (attn, self.input_layernorm, {"fusions": boundary_fusions}),
@@ -1412,8 +1512,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 config,
                 layer_id,
                 attn_read=NormQuantReadout(
-                    fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
+                    fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None,
+                    ar_bmg=ar86_supports_projection(self.qkv_proj),
                 ),
+                ffn_read=ar86_shared_readout(self.mlp),
             )
             self.attn_boundary, self.ffn_boundary = append_stages(
                 (attn, self.input_layernorm, {"fusions": boundary_fusions}),
@@ -1488,7 +1590,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         return q, k, v, gate
 
     def forward_prepare_native(self, positions, hidden_states):
-        if _use_aiter and isinstance(hidden_states, tuple):
+        if (_use_aiter or ar86_enabled) and isinstance(hidden_states, tuple):
             hidden_states = _select_fused_ar_input_for_linear(
                 hidden_states, self.qkv_proj
             )
@@ -1510,8 +1612,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
-    def forward_prepare_fused_gate(self, positions, hidden_states):
-        if _use_aiter and isinstance(hidden_states, tuple):
+    def forward_prepare_fused_gate(self, positions, hidden_states, fuse_rope=False):
+        if (_use_aiter or ar86_enabled) and isinstance(hidden_states, tuple):
             hidden_states = _select_fused_ar_input_for_linear(
                 hidden_states, self.qkv_proj
             )
@@ -1521,6 +1623,59 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
             seq_len = q_gate.shape[0]
+            if fuse_rope and _is_xpu and envs.SGLANG_XPU_TP_QK_ROPE_SYCL.get():
+                from sglang.kernels.ops.attention.xpu_tp_attention_sycl import (
+                    try_qk_rope,
+                )
+
+                self.rotary_emb._match_cos_sin_cache_dtype(q_gate)
+                tp_qkv = try_qk_rope(
+                    q_gate, k, self.q_norm.weight, self.k_norm.weight,
+                    self.rotary_emb.cos_sin_cache, positions,
+                    self.q_norm.variance_epsilon, self.num_heads,
+                    self.num_kv_heads, self.head_dim,
+                    self.rotary_emb.rotary_dim, self.rotary_emb.is_neox_style,
+                )
+                if tp_qkv is not None:
+                    q_flat, k_flat, gate_flat = tp_qkv
+                    return q_flat, k_flat, v, gate_flat.view(seq_len, -1)
+            if (
+                fuse_rope
+                and _is_xpu
+                and seq_len == 1
+                and positions.ndim == 1
+                and q_gate.dtype == k.dtype == torch.bfloat16
+                and (self.num_heads, self.num_kv_heads, self.head_dim) == (16, 2, 256)
+                and self.rotary_emb.rotary_dim == 64
+                and self.rotary_emb.is_neox_style
+                and torch.xpu.get_device_properties(q_gate.device).device_id == 0xE223
+            ):
+                if not getattr(self, "_xpu_fused_rope_logged", False):
+                    logger.info(
+                        "Using B70 decode QK norm/RoPE/gate fusion with native BF16 products."
+                    )
+                    self._xpu_fused_rope_logged = True
+                self.rotary_emb._match_cos_sin_cache_dtype(q_gate)
+                q_flat, k_flat, gate_flat = fused_qk_gemma_rmsnorm_rope_gate(
+                    q_gate,
+                    k,
+                    self.q_norm.weight.data,
+                    self.k_norm.weight.data,
+                    self.rotary_emb.cos_sin_cache,
+                    positions,
+                    self.q_norm.variance_epsilon,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.rotary_emb.rotary_dim,
+                    round_rope_products=True,
+                )
+                return (
+                    q_flat.view(seq_len, -1),
+                    k_flat.view(seq_len, -1),
+                    v,
+                    gate_flat.view(seq_len, -1),
+                )
             q_flat, k_flat, gate_flat = fused_qk_gemma_rmsnorm_with_gate(
                 q_gate,
                 k,
@@ -1575,6 +1730,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             return self.forward_prepare_fused_gate(
                 positions=positions,
                 hidden_states=hidden_states,
+                fuse_rope=_is_xpu and forward_batch.forward_mode.is_decode_or_idle(),
             )
         if (
             not _is_npu
@@ -1604,9 +1760,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        from sglang.srt.layers import ar2015_attention_post as post
+        request = post.make_request(self.attn, self.o_proj, gate, forward_batch) if self.attn_output_gate else None
+        if request is None:
+            attn_output = self.attn(q, k, v, forward_batch)
+        else:
+            attn_output = self.attn(q, k, v, forward_batch, ar_gated_output=request)
 
-        if self.attn_output_gate:
+        if isinstance(attn_output, post.GatedFp8Output):
+            attn_output = (attn_output.quant, attn_output.scale)
+        elif self.attn_output_gate:
             if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
                 attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
             elif not _is_npu:
@@ -1615,6 +1778,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
 
+        from sglang.srt.layers.ar1532_outnorm import try_defer as defer_projection
+        deferred = defer_projection(self.o_proj, attn_output, forward_batch)
+        if deferred is not None:
+            return deferred
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1833,6 +2000,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        from sglang.srt.layers.ar1502_pregate import install as install_pregate
+        install_pregate(self.layers)
+        from sglang.srt.layers.ar1532_outnorm import install as install_projection_norm
+        install_projection_norm(self.layers)
         self.layers_to_capture = []
 
     def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:

@@ -60,7 +60,8 @@ class DeviceType(str, Enum):
     HIP = "hip"
     NPU = "npu"  # Ascend NPU (torch_npu / sgl_kernel_npu)
     CPU = "cpu"
-    # TODO(RFC #29630): XPU / MUSA / ... as backends land.
+    XPU = "xpu"  # Intel XPU (torch.xpu / SYCL)
+    # TODO(RFC #29630): MUSA / ... as backends land.
 
 
 class PlatformInfo(msgspec.Struct, frozen=True):
@@ -107,6 +108,9 @@ class PlatformInfo(msgspec.Struct, frozen=True):
                     cuda_arch_major=major,
                     cuda_arch_minor=minor,
                 )
+            xpu = getattr(torch, "xpu", None)
+            if xpu is not None and xpu.is_available():
+                return cls(device_type="xpu")
         except Exception:
             pass
         return cls()
@@ -139,6 +143,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
     CUDA: ClassVar[CapabilityRequirement]
     HIP: ClassVar[CapabilityRequirement]
     NPU: ClassVar[CapabilityRequirement]
+    XPU: ClassVar[CapabilityRequirement]
 
     @classmethod
     def cuda(
@@ -164,6 +169,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
 CapabilityRequirement.CUDA = CapabilityRequirement(device=DeviceType.CUDA)
 CapabilityRequirement.HIP = CapabilityRequirement(device=DeviceType.HIP)
 CapabilityRequirement.NPU = CapabilityRequirement(device=DeviceType.NPU)
+CapabilityRequirement.XPU = CapabilityRequirement(device=DeviceType.XPU)
 
 CUDA_ONLY: FrozenSet[CapabilityRequirement] = frozenset({CapabilityRequirement.CUDA})
 

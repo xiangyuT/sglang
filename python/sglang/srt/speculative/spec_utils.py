@@ -774,6 +774,11 @@ def draft_tp_context(owns_attention: bool):
     target's TP placement. Enter it from outside any draft scope, where
     ``attn_tp_group`` is still the target's.
     """
+    if (os.environ.get("SGLANG_XPU_GGUF_TP_EP") == "1"
+            and get_parallel().tp_size > 1):
+        # The raw GGUF draft retains its full one-layer weights on every GPU.
+        # Reuse the existing singleton coordinator and scoped topology checks.
+        return patch_tensor_parallel_group(get_self_pp_group(), owns_attention=True)
     if not owns_attention:
         return contextlib.nullcontext()
     return patch_tensor_parallel_group(

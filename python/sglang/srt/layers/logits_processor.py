@@ -20,6 +20,7 @@ from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import os
 import torch
 from torch import nn
 
@@ -480,6 +481,7 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
+        self._xpu_dflash_target_state = None
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -879,6 +881,8 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
         use_logits_buffer: bool = True,
+        *,
+        skip_xpu_target_head: bool = False,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -886,6 +890,44 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
+        if (
+            not skip_xpu_target_head
+            and envs.SGLANG_XPU_PAGED_DFLASH.get()
+            and envs.SGLANG_XPU_DFLASH_TARGET_HEAD_SYCL.get()
+            and not torch.compiler.is_compiling()
+            and hidden_states.device.type == "xpu"
+        ):
+            from sglang.kernels.ops.speculative.dflash_target_head_sycl import (
+                TargetHeadPlan,
+                TargetHeadState,
+                can_use_target_head,
+            )
+
+            state = self._xpu_dflash_target_state
+            # An unsupported eager call can reuse the logits buffer of a prior
+            # supported one. Never finish it using that prior call's hidden.
+            if state is not None and not torch.xpu.is_current_stream_capturing():
+                state.eager_plan = None
+            if can_use_target_head(
+                self, hidden_states, lm_head, logits_metadata, embedding_bias
+            ):
+                if state is None:
+                    state = TargetHeadState(lm_head)
+                    self._xpu_dflash_target_state = state
+                if state.source_matches(lm_head):
+                    plan = TargetHeadPlan(
+                        state,
+                        hidden_states,
+                        lm_head,
+                        logits_metadata,
+                        use_logits_buffer,
+                    )
+                    logits = self._copy_logits_to_buffer(
+                        plan.propose(), logits_metadata, use_buffer=use_logits_buffer
+                    )
+                    plan.complete(logits)
+                    state.bind(plan, logits)
+                    return logits
         _trace_e2e_logits(
             "get_logits_enter",
             hidden_shape=tuple(hidden_states.shape),
@@ -913,7 +955,22 @@ class LogitsProcessor(nn.Module):
             else LoRABatchLayout.DP_LOCAL
         )
         with get_forward().scoped(lora_batch_layout=lora_batch_layout):
-            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+            tp_partial_logits = None
+            if envs.SGLANG_XPU_TP_BOUNDED_HEAD.get() and type(self) is LogitsProcessor:
+                from sglang.srt.layers.xpu_tp_bounded_head import try_run
+
+                tp_partial_logits = try_run(
+                    self, hidden_states, lm_head, logits_metadata, embedding_bias
+                )
+            if tp_partial_logits is not None:
+                logits = tp_partial_logits.logits
+            elif (os.environ.get('CODEX_AR246_HEAD')=='1' and type(self) is LogitsProcessor
+                and logits_metadata is not None and logits_metadata.forward_mode.is_decode()):
+                logits = self._compute_lm_head(hidden_states,lm_head,embedding_bias,ar246_decode=True,
+                    ar449_decode=(self.logit_scale is None and not self.final_logit_softcapping),
+                    ar449_output=logits_metadata.next_token_logits_buffer if use_logits_buffer else None)
+            else:
+                logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
@@ -922,6 +979,13 @@ class LogitsProcessor(nn.Module):
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
+
+        if os.environ.get("SGLANG_XPU_GGUF_TP_GREEDY_GATHER") == "1":
+            from sglang.srt.layers.quantization.gguf_tp_greedy import try_gather
+
+            compact = try_gather(self, logits, lm_head, logits_metadata, embedding_bias)
+            if compact is not None:
+                return compact
 
         if self._can_gather_softcap_fused(
             logits, local_hidden_states, lm_head, logits_metadata
@@ -936,7 +1000,9 @@ class LogitsProcessor(nn.Module):
             )
 
         used_tp_lm_head_all_to_all = False
-        if self.do_tensor_parallel_all_gather:
+        if self.do_tensor_parallel_all_gather and not (
+            tp_partial_logits is not None and tp_partial_logits.gathered
+        ):
             _trace_e2e_logits(
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
             )
@@ -985,6 +1051,25 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def finish_xpu_dflash_target_head(
+        self, logits: torch.Tensor, can_run_graph: bool, allow_greedy: bool
+    ) -> torch.Tensor:
+        """Restore original scores before penalties, grammar or logprob use."""
+        state = self._xpu_dflash_target_state
+        if state is None:
+            return logits
+        plan = state.plan_for(logits, can_run_graph)
+        if plan is None or (allow_greedy and plan.source_matches()):
+            return logits
+        return self._get_logits(
+            plan.hidden,
+            plan.head,
+            plan.metadata,
+            None,
+            plan.use_buffer,
+            skip_xpu_target_head=True,
+        )
 
     def _can_gather_softcap_fused(
         self,
@@ -1061,6 +1146,7 @@ class LogitsProcessor(nn.Module):
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
+        *, ar246_decode: bool = False, ar449_decode: bool = False, ar449_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
@@ -1103,6 +1189,22 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
+                if (
+                    envs.SGLANG_XPU_AR_STATIC_PACKED_HEAD_SYCL.get()
+                    and not torch.compiler.is_compiling()
+                ):
+                    from sglang.srt.runtime_context import get_spec
+
+                    if get_spec().speculative_algorithm is None:
+                        from sglang.kernels.ops.gemm.xpu_ar_static_head_sycl import (
+                            can_use_ar_static_head,
+                            xpu_ar_static_head,
+                        )
+
+                        if embedding_bias is None and can_use_ar_static_head(
+                            hidden_states, lm_head.weight
+                        ):
+                            return xpu_ar_static_head(hidden_states,lm_head,ar246_decode=ar246_decode,ar449_decode=ar449_decode,ar449_output=ar449_output)
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
                 )

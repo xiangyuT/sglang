@@ -10,9 +10,7 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 
-def _supports_expert_gemv(layer, config):
-    if not envs.SGLANG_XPU_M1_FP8_EXPERT_GEMV.get():
-        return False
+def _supports_expert_layout(layer, config):
     if (
         config.activation != "silu"
         or not config.is_gated
@@ -24,6 +22,8 @@ def _supports_expert_gemv(layer, config):
         or config.swiglu_limit is not None
         or getattr(layer, "w13_bias", None) is not None
         or getattr(layer, "w2_bias", None) is not None
+        or getattr(layer, "w13_weight_bias", None) is not None
+        or getattr(layer, "w2_weight_bias", None) is not None
     ):
         return False
     w13, w2 = layer.w13_weight, layer.w2_weight
@@ -43,6 +43,23 @@ def _supports_expert_gemv(layer, config):
     )
 
 
+def _supports_expert_gemv(layer, config):
+    return envs.SGLANG_XPU_M1_FP8_EXPERT_GEMV.get() and _supports_expert_layout(
+        layer, config
+    )
+
+
+def _supports_scaled_fp8(store):
+    # Cover nonresident experts as well: later page-ins must obey the same bound.
+    for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+        scales = store.host[name]
+        magnitude = scales.abs()
+        safe = (magnitude == 0) | ((magnitude >= 2.0**-118) & (magnitude <= 2.0**118))
+        if not torch.all(torch.isfinite(scales) & safe).item():
+            return False
+    return True
+
+
 class XpuDeviceExecutor:
     def __init__(
         self, *, base_method, store, residency, contract, routed_scaling_factor, layer
@@ -53,10 +70,53 @@ class XpuDeviceExecutor:
         self.contract = contract
         self.routed_scaling_factor = routed_scaling_factor
         self.use_expert_gemv = _supports_expert_gemv(layer, base_method.runner.config)
+        self.use_scaled_fp8 = self.use_expert_gemv and _supports_scaled_fp8(store)
+        self.use_compact_moe = False
+        self.use_paged_compact = False
+        if (
+            envs.SGLANG_XPU_PAGED_DFLASH.get()
+            and envs.SGLANG_XPU_DFLASH_COMPACT_MOE.get()
+        ):
+            from sglang.srt.layers.moe import get_moe_runner_backend
+            from sglang.srt.runtime_context import get_spec
+
+            self.use_compact_moe = (
+                get_spec().speculative_algorithm == "DFLASH"
+                and not get_moe_runner_backend().is_triton()
+                and base_method.runner.config.routed_scaling_factor == 1.0
+                and _supports_expert_layout(layer, base_method.runner.config)
+            )
+            if self.use_compact_moe:
+                from sglang.kernels.ops.moe.xpu_compact_moe import load_compact_moe
+
+                load_compact_moe()
+                if base_method.runner.config.layer_id == 0:
+                    logger.info(
+                        "Using compact native W8A16 scheduling for B70 DFlash "
+                        "2–8-row experts; weights retain resident-slot layout."
+                    )
+        self.use_paged_compact = (
+            self.use_compact_moe
+            and envs.SGLANG_XPU_DFLASH_PAGED_MOE.get()
+            and all(
+                h.is_pinned() and h.is_contiguous() and h.data_ptr() % 64 == 0
+                for h in store.host.values()
+            )
+        )
+        if self.use_paged_compact:
+            from sglang.kernels.ops.moe.xpu_compact_paged import load_paged_moe
+
+            load_paged_moe()
+            if base_method.runner.config.layer_id == 0:
+                logger.info(
+                    "Using B70 compact native DFlash host fetch/cache fill; "
+                    "expert-major scheduling, original DPAS arithmetic."
+                )
         if self.use_expert_gemv and base_method.runner.config.layer_id == 0:
             logger.info(
                 "Using B70 single-token top-8 block-FP8 expert GEMV; "
-                "prefill keeps native grouped GEMM."
+                "scaled FP8 decode=%s; prefill keeps native grouped GEMM.",
+                self.use_scaled_fp8,
             )
         device = residency.step.device
         slots = residency.slot_expert.numel()
@@ -82,20 +142,52 @@ class XpuDeviceExecutor:
         self.hosts = torch.tensor(hosts, dtype=torch.uint64, device=device)
         self.gpus = torch.tensor(gpus, dtype=torch.uint64, device=device)
         self.rows = tuple(rows)
+        if self.use_scaled_fp8 or self.use_paged_compact:
+            # The fused fetch path uses an explicit order, independent of the
+            # format's host-store dictionary insertion order.
+            names = (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale_inv",
+                "w2_weight_scale_inv",
+            )
+            self.expert_store = tuple(store.host[name] for name in names)
+            self.expert_hosts = torch.tensor(
+                [store.host[name].data_ptr() for name in names],
+                dtype=torch.uint64,
+                device=device,
+            )
+            self.expert_gpus = torch.tensor(
+                [getattr(layer, name).data_ptr() for name in names],
+                dtype=torch.uint64,
+                device=device,
+            )
 
-    def run(self, layer, dispatch_output):
+        from sglang.srt.layers.moe.paged_experts.cpu40 import register
+        register(self, layer)
+
+    def run(self, layer, dispatch_output, ar_joint=None):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         topk = dispatch_output.topk_output
         n = topk.topk_ids.numel()
-        decide(
-            topk.topk_ids,
-            topk.topk_weights,
-            self.residency,
-            self.mapped_ids,
-            self.mapped_weights,
-        )
-        gather(self.hosts, self.gpus, self.rows, self.residency)
+        from sglang.srt.layers.moe.paged_experts.fused37 import PlannedTopKOutput
+        planned = isinstance(topk, PlannedTopKOutput)
+        if planned:
+            if topk.executor is not self:
+                raise RuntimeError("AR37 planned output belongs to another executor")
+        else:
+            decide(
+                topk.topk_ids,
+                topk.topk_weights,
+                self.residency,
+                self.mapped_ids,
+                self.mapped_weights,
+            )
+        from sglang.srt.layers.moe.paged_experts.cpu40 import run as cpu_run
+        result = cpu_run(self, layer, dispatch_output, ar_shared=ar_joint)
+        if result is not None:
+            return result
         remapped = dispatch_output._replace(
             topk_output=topk._replace(
                 topk_ids=self.mapped_ids[:n].view(topk.topk_ids.shape),
@@ -116,7 +208,7 @@ class XpuDeviceExecutor:
                 xpu_block_fp8_experts,
             )
 
-            partial = xpu_block_fp8_experts(
+            args = (
                 hidden_states,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -125,10 +217,63 @@ class XpuDeviceExecutor:
                 remapped.topk_output.topk_ids,
                 remapped.topk_output.topk_weights,
             )
+            if self.use_scaled_fp8:
+                from sglang.kernels.ops.moe.xpu_paged_fp8_experts import (
+                    xpu_paged_block_fp8_experts,
+                )
+
+                partial = xpu_paged_block_fp8_experts(
+                    *args,
+                    self.expert_hosts,
+                    self.expert_gpus,
+                    self.residency,
+                    ar_joint=ar_joint,
+                    scales_prepared=planned,
+                )
+            else:
+                assert ar_joint is None, "AR101 needs scaled paged FP8"
+                gather(self.hosts, self.gpus, self.rows, self.residency)
+                partial = xpu_block_fp8_experts(*args)
         else:
-            partial = self.base_method.apply(
-                layer=layer, dispatch_output=remapped
-            ).hidden_states
+            assert ar_joint is None, "AR101 needs M1 unquantized standard dispatch"
+            if (
+                self.use_compact_moe
+                and hidden_states.ndim == 2
+                and 2 <= hidden_states.shape[0] <= 8
+                and hidden_states.shape[1] == 2048
+                and hidden_states.dtype == torch.bfloat16
+                and hidden_states.is_contiguous()
+                and dispatch_output.hidden_states_scale is None
+                and dispatch_output.hidden_states_pre_quant is None
+                and topk.topk_ids.shape == (hidden_states.shape[0], 8)
+            ):
+                from sglang.kernels.ops.moe.xpu_compact_moe import xpu_compact_moe
+
+                paging = None
+                if self.use_paged_compact:
+                    paging = (
+                        self.expert_hosts,
+                        self.expert_gpus,
+                        self.residency,
+                        self.expert_store,
+                    )
+                else:
+                    gather(self.hosts, self.gpus, self.rows, self.residency)
+                partial = xpu_compact_moe(
+                    hidden_states,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.w13_weight_scale_inv,
+                    layer.w2_weight_scale_inv,
+                    remapped.topk_output.topk_ids,
+                    remapped.topk_output.topk_weights,
+                    paging=paging,
+                )
+            else:
+                gather(self.hosts, self.gpus, self.rows, self.residency)
+                partial = self.base_method.apply(
+                    layer=layer, dispatch_output=remapped
+                ).hidden_states
         return StandardCombineInput(
             hidden_states=self.contract.finish(
                 merged=partial,

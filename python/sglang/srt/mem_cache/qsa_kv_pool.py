@@ -9,6 +9,7 @@ Qwen3Next-DSA) adds only the flat per-token index-K cache.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import List, Optional
 
@@ -170,7 +171,14 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        # A speculative window can cross a compression boundary. Retain the
+        # old group's prefix while all new rows are stored, and retain it
+        # across rejected lookahead. Four groups cover the guarded B70
+        # four-token verify and draft-extend paths without a rollback copy.
+        self.qsa_pending_ring_size = self.qsa_compress_ratio
+        if torch.device(device).type == "xpu" and os.environ.get("SGLANG_XPU_QSA_CAUSAL_RING") == "1":
+            self.qsa_pending_ring_size *= 4
+        ring_slots = self.qsa_num_request_slots * self.qsa_pending_ring_size
         # These buffers participate in Mooncake PD transfer just like the base
         # KV and Mamba pools.  Keep their allocation in the same memory-saver
         # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the
@@ -234,7 +242,13 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self, layer_id: int, loc: torch.Tensor, token_k: torch.Tensor
     ) -> None:
         buffer = self.get_qsa_key_state_buffer(layer_id)
-        buffer[loc.long()] = token_k.to(buffer.dtype)
+        value = token_k.to(buffer.dtype)
+        if buffer.device.type == "xpu":
+            from sglang.kernels.ops.attention.xpu_qsa_sycl import try_store_rows
+
+            if try_store_rows(buffer, loc, value):
+                return
+        buffer[loc.long()] = value
 
     def set_qsa_rope_position_buffer(
         self, loc: torch.Tensor, positions: torch.Tensor
@@ -246,7 +260,13 @@ class QSATokenToKVPool(HybridLinearKVPool):
             raise ValueError(
                 f"QSA RoPE positions must be [tokens] or [3, tokens], got {positions.shape}"
             )
-        self.qsa_rope_position_buffer[loc.long()] = positions.transpose(0, 1)
+        value = positions.transpose(0, 1)
+        if value.device.type == "xpu":
+            from sglang.kernels.ops.attention.xpu_qsa_sycl import try_store_rows
+
+            if try_store_rows(self.qsa_rope_position_buffer, loc, value):
+                return
+        self.qsa_rope_position_buffer[loc.long()] = value
 
     def get_qsa_rope_position_buffer(self, loc: torch.Tensor) -> torch.Tensor:
         return self.qsa_rope_position_buffer[loc.long()]
@@ -262,7 +282,13 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self, layer_id: int, loc: torch.Tensor, compressed_k: torch.Tensor
     ) -> None:
         buffer = self.get_qsa_compressed_k_buffer(layer_id)
-        buffer[loc.long()] = compressed_k.to(buffer.dtype)
+        value = compressed_k.to(buffer.dtype)
+        if buffer.device.type == "xpu":
+            from sglang.kernels.ops.attention.xpu_qsa_sycl import try_store_rows
+
+            if try_store_rows(buffer, loc, value):
+                return
+        buffer[loc.long()] = value
 
     @staticmethod
     def _get_paged_state_buf_infos(tensors, page_size: int):
@@ -283,7 +309,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         tensors = [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
         return self._get_paged_state_buf_infos(
             tensors,
-            self.qsa_compress_ratio,
+            self.qsa_pending_ring_size,
         )
 
     def get_qsa_pending_state_layer_ids(self):

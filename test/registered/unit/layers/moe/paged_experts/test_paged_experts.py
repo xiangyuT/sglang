@@ -5,7 +5,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe.paged_experts import PagedExpertsMoEMethod
-from sglang.srt.layers.moe.paged_experts.formats import ExpertFormat, UnquantizedFormat
+from sglang.srt.layers.moe.paged_experts.formats import (
+    ExpertFormat,
+    Fp8BlockFormat,
+    UnquantizedFormat,
+)
 from sglang.srt.layers.moe.paged_experts.method import (
     _cap_decode_capture_batch_sizes,
     check_paged_experts_compat,
@@ -14,6 +18,7 @@ from sglang.srt.layers.moe.paged_experts.residency import (
     DeviceResidency,
     LRUPolicy,
     plan_waves,
+    prefill_expert_priorities,
 )
 from sglang.srt.layers.moe.paged_experts.runners import (
     MarlinContract,
@@ -203,6 +208,117 @@ class TestXpuPagedForward(CustomTestCase):
         self.assertEqual(original.routed_scaling_factor, 2.5)
 
 
+class TestPrefillCachePriority(CustomTestCase):
+    def test_priorities_use_only_current_chunk_and_ignore_padding(self):
+        ids = torch.tensor([[0, 1, -1], [0, 2, 2], [0, -1, 3]], dtype=torch.int32)
+        self.assertEqual(
+            prefill_expert_priorities(ids, 5, recent_tokens=2),
+            [(2, 3, 2, 0), (0, 1, 0, 1), (2, 2, 1, 2), (1, 1, 2, 3), (0, 0, -1, 4)],
+        )
+        for invalid in (ids.float(), ids.flatten(), torch.tensor([[5]])):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    prefill_expert_priorities(invalid, 5)
+
+    def test_priority_changes_victims_without_extra_loads_or_waves(self):
+        original, candidate = LRUPolicy(4), LRUPolicy(4)
+        priorities = [(0, 0, -1, e) for e in range(6)]
+        priorities[0], priorities[1] = (8, 8, 3, 0), (7, 7, 3, 1)
+        baseline = plan_waves(original, list(range(6)))
+        waves = plan_waves(candidate, list(range(6)), priorities)
+        self.assertEqual(set(original.resident), {2, 3, 4, 5})
+        self.assertEqual(set(candidate.resident), {0, 1, 4, 5})
+        self.assertEqual(len(waves), len(baseline))
+        self.assertEqual(sum(len(w.loads) for w in waves), 2)
+        self.assertEqual(sum(len(w.loads) for w in baseline), 2)
+        self.assertEqual(sorted(e for w in waves for e in w.experts), list(range(6)))
+        before = dict(candidate.resident)
+        candidate.prioritize(priorities)
+        self.assertEqual(dict(candidate.resident), before)
+        self.assertEqual(list(candidate.resident), [4, 5, 1, 0])
+
+    def test_random_plans_keep_coverage_capacity_and_minimal_copies(self):
+        generator = torch.Generator().manual_seed(71)
+        for _ in range(100):
+            resident = torch.randperm(16, generator=generator)[:4].tolist()
+            original, candidate = LRUPolicy(4), LRUPolicy(4)
+            original.resident = type(original.resident)(zip(resident, range(4)))
+            candidate.resident = type(candidate.resident)(original.resident)
+            ids = torch.randint(-1, 16, (12, 8), generator=generator)
+            distinct = sorted(set(ids[ids >= 0].tolist()))
+            needed_loads = len(set(distinct) - set(resident))
+            baseline = plan_waves(original, distinct)
+            priorities = prefill_expert_priorities(ids, 16)
+            waves = plan_waves(candidate, distinct, priorities)
+            self.assertEqual(len(waves), len(baseline))
+            self.assertEqual(sum(len(w.loads) for w in waves), needed_loads)
+            self.assertEqual(sum(len(w.loads) for w in baseline), needed_loads)
+            self.assertEqual(sorted(e for w in waves for e in w.experts), distinct)
+            self.assertEqual(sorted(candidate.resident.values()), list(range(4)))
+
+    def test_priority_metadata_survives_device_residency_roundtrip(self):
+        policy = LRUPolicy(K)
+        priority = [(e, e, e, e) for e in reversed(range(E))]
+        policy.prioritize(priority)
+        mapping = dict(policy.resident)
+        state = DeviceResidency(E, K, "cpu")
+        state.store_from(policy)
+        restored = LRUPolicy(K)
+        state.load_into(restored)
+        self.assertEqual(list(restored.resident.items()), list(policy.resident.items()))
+        self.assertEqual(dict(restored.resident), mapping)
+
+    def test_eager_execution_keeps_each_logical_entry_and_weight(self):
+        for contract in CONTRACTS:
+            method, layer, full = _paged_layer(contract)
+            method.executor.prefill_priority = True
+            computed = [0]
+            native = method.base_method.apply
+
+            def counted(layer, dispatch_output):
+                topk = dispatch_output.topk_output
+                computed[0] += int(
+                    ((topk.topk_ids >= 0) & (topk.topk_weights > 0)).sum()
+                )
+                return native(layer, dispatch_output)
+
+            method.base_method.apply = counted
+            generator = torch.Generator().manual_seed(42)
+            for _ in range(5):
+                d = _step(64)
+                ids = torch.randint(-1, E, (64, 8), generator=generator).int()
+                d = d._replace(
+                    topk_output=d.topk_output._replace(
+                        topk_ids=ids,
+                        topk_weights=torch.rand((64, 8), generator=generator) + 0.1,
+                    )
+                )
+                method.base_method.rows = 0
+                computed[0] = 0
+                out = method.apply(layer, d).hidden_states
+                torch.testing.assert_close(out, _reference(full, d))
+                self.assertEqual(computed[0], int((ids >= 0).sum()))
+                for expert, slot in method.policy.resident.items():
+                    torch.testing.assert_close(
+                        layer.w13_weight[slot], method.store.host["w13_weight"][expert]
+                    )
+
+    def test_all_padding_preserves_cache_order(self):
+        method, layer, _ = _paged_layer()
+        method.executor.prefill_priority = True
+        d = _step(64)
+        ids = torch.full((64, 8), -1, dtype=torch.int32)
+        d = d._replace(
+            topk_output=d.topk_output._replace(
+                topk_ids=ids, topk_weights=torch.ones((64, 8))
+            )
+        )
+        before = list(method.policy.resident.items())
+        out = method.apply(layer, d).hidden_states
+        self.assertEqual(list(method.policy.resident.items()), before)
+        torch.testing.assert_close(out, torch.zeros_like(out))
+
+
 class TestLoading(CustomTestCase):
     def test_rejects_post_load_weight_transform(self):
         method, layer, _ = _paged_layer()
@@ -376,6 +492,9 @@ class TestCompat(CustomTestCase):
         graphs=False,
         prefill_graphs=False,
         expert_format=None,
+        paged_dflash=False,
+        draft_tokens=2,
+        draft_topk=1,
     ):
         from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 
@@ -403,8 +522,14 @@ class TestCompat(CustomTestCase):
             patch(
                 method + "get_spec",
                 return_value=SimpleNamespace(
-                    speculative_algorithm=speculative_algorithm
+                    speculative_algorithm=speculative_algorithm,
+                    speculative_num_draft_tokens=draft_tokens,
+                    speculative_eagle_topk=draft_topk,
                 ),
+            ),
+            patch(
+                method + "envs.SGLANG_XPU_PAGED_DFLASH.get",
+                return_value=paged_dflash,
             ),
             patch(
                 method + "get_model", return_value=SimpleNamespace(load_format="auto")
@@ -455,6 +580,51 @@ class TestCompat(CustomTestCase):
     def test_rejects_speculative_decoding(self):
         with self.assertRaisesRegex(RuntimeError, "speculative decoding"):
             self._check(speculative_algorithm="EAGLE")
+
+    def test_xpu_dflash_requires_opt_in(self):
+        with self.assertRaisesRegex(RuntimeError, "speculative decoding"):
+            self._check(
+                xpu=True,
+                speculative_algorithm="DFLASH",
+                expert_format=Fp8BlockFormat(),
+            )
+
+    def test_xpu_block_fp8_dflash_one_wave(self):
+        self._check(
+            xpu=True,
+            graphs=True,
+            paged_dflash=True,
+            speculative_algorithm="DFLASH",
+            expert_format=Fp8BlockFormat(),
+        )
+
+    def test_dflash_rejects_oversized_verify_wave(self):
+        with self.assertRaisesRegex(RuntimeError, "one resident expert wave"):
+            self._check(
+                xpu=True,
+                paged_dflash=True,
+                speculative_algorithm="DFLASH",
+                expert_format=Fp8BlockFormat(),
+                draft_tokens=K,
+            )
+
+    def test_dflash_keeps_other_combinations_guarded(self):
+        for override in (
+            dict(xpu=False),
+            dict(expert_format=UnquantizedFormat()),
+            dict(speculative_algorithm="DSPARK"),
+            dict(draft_topk=2),
+        ):
+            with self.subTest(override=override):
+                args = dict(
+                    xpu=True,
+                    paged_dflash=True,
+                    speculative_algorithm="DFLASH",
+                    expert_format=Fp8BlockFormat(),
+                )
+                args.update(override)
+                with self.assertRaisesRegex(RuntimeError, "speculative decoding"):
+                    self._check(**args)
 
     def test_requires_num_resident(self):
         with self.assertRaisesRegex(RuntimeError, "--paged-experts-num-resident"):

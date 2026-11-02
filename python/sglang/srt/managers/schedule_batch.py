@@ -2542,6 +2542,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # Pure-AR experimental per-forward state; fresh storage preserves overlap.
+    ar231_state: Optional[tuple] = None
     # DSV4-NPU: KV-only per-pool slot bundle from
     # DSV4NPUTokenToKVPoolAllocator (None elsewhere).
     out_cache_loc_dsv4: Optional[Any] = None
@@ -3683,6 +3685,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def prepare_for_decode(self):
+        self.ar231_state = None
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
@@ -3733,9 +3736,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # New-tensor avoids racing model_worker_batch refs queued for
         # overlap forward.
-        self.seq_lens = self.seq_lens + 1
+        if self.ar231_state is not None:
+            self.seq_lens, self.orig_seq_lens = self.ar231_state[:2]
+        else:
+            self.seq_lens = self.seq_lens + 1
+            self.orig_seq_lens = self.orig_seq_lens + 1
         self.seq_lens_cpu = self.seq_lens_cpu + 1
-        self.orig_seq_lens = self.orig_seq_lens + 1
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 

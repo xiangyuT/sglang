@@ -873,6 +873,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             if not head_supported:
                 return _eager("unsupported quantized lm_head")
             self.draft_model.lm_head = lm_head
+            prepare_head = getattr(self.draft_model, "prepare_xpu_candidate_head", None)
+            if prepare_head is not None:
+                prepare_head()
             if self._target_tp_rank == 0:
                 logger.info(
                     "DFLASH selector decode folded into the draft cuda graph "
@@ -2862,6 +2865,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
         target_lp = self._target_logits_processor
+        if (
+            target_lp is not None
+            and envs.SGLANG_XPU_PAGED_DFLASH.get()
+            and envs.SGLANG_XPU_DFLASH_TARGET_HEAD_SYCL.get()
+        ):
+            logits_output.next_token_logits = target_lp.finish_xpu_dflash_target_head(
+                logits_output.next_token_logits,
+                can_run_cuda_graph,
+                self._can_skip_verify_logits(batch, sampling_info),
+            )
         if target_lp is not None and target_lp.is_deferred_shard(
             logits_output.next_token_logits
         ):

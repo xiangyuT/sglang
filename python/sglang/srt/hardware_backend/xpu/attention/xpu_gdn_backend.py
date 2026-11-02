@@ -1,9 +1,15 @@
+import logging
+
 import torch
 from sgl_kernel import gdn_attention as sgl_kernel_gdn_attention
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import mamba_cache_chunk_size
+
+logger = logging.getLogger(__name__)
 
 
 class XpuGDNAttnBackend(GDNAttnBackend):
@@ -15,6 +21,33 @@ class XpuGDNAttnBackend(GDNAttnBackend):
     ``--linear-attn-backend intel_xpu`` (the default remains ``triton``, same
     as other platforms).
     """
+
+    def _decode_initial_state(self, bs, device):
+        if not envs.SGLANG_XPU_GDN_INITIAL_STATE_CACHE.get():
+            return torch.ones(bs, dtype=torch.bool, device=device)
+
+        cache = getattr(self, "_decode_initial_state_cache", None)
+        if cache is None:
+            cache = self._decode_initial_state_cache = {}
+        key = (device, bs)
+        state = cache.get(key)
+        if state is None:
+            if torch.xpu.is_current_stream_capturing():
+                # Do not cache an unexecuted graph allocation for another graph
+                # or stream to consume. Keep the original fill on a cold key.
+                return torch.ones(bs, dtype=torch.bool, device=device)
+            state = torch.ones(bs, dtype=torch.bool, device=device)
+            # One-time warmup initialization; the shared constant must be ready
+            # before any capture stream can read it. No per-token synchronize.
+            torch.xpu.current_stream(device).synchronize()
+            cache[key] = state
+            logger.info(
+                "XPU GDN decode initial-state cache: device=%s bs=%d; "
+                "read-only true flags initialized before capture",
+                device, bs,
+            )
+        state.record_stream(torch.xpu.current_stream(device))
+        return state
 
     def supports_fused_gdn(self, layer, forward_batch: ForwardBatch) -> bool:
         """Conservative guard: only the plain decode / non-prefix-cached,
@@ -39,8 +72,7 @@ class XpuGDNAttnBackend(GDNAttnBackend):
         if mode.is_target_verify() or mode.is_draft_extend_v2():
             return False
         fm = self.forward_metadata
-        if getattr(fm, "has_mamba_track_mask", False):
-            # chunked prefix-cache intermediate-state tracking unsupported
+        if getattr(fm, "has_mamba_track_mask", False) and not self._has_cpu_prefill_track_metadata(forward_batch):
             return False
         if getattr(fm, "query_start_loc", None) is None:
             return False
@@ -57,6 +89,7 @@ class XpuGDNAttnBackend(GDNAttnBackend):
         forward_batch: ForwardBatch,
         projected_states_qkvz: torch.Tensor,
         projected_states_ba: torch.Tensor,
+        preconv=None,
     ):
         """Run the fused SYCL GDN op and return ``(core_attn_out, z)``.
 
@@ -79,13 +112,148 @@ class XpuGDNAttnBackend(GDNAttnBackend):
         bs = forward_batch.batch_size
         num_actual_tokens = projected_states_qkvz.shape[0]
 
+        if preconv is not None:
+            mixed, z, state_pointer, index_pointer, layer_id = preconv
+            assert state_pointer == conv_states.data_ptr()
+            assert index_pointer == cache_indices.data_ptr() and layer_id == layer.layer_id
+            assert forward_batch.forward_mode.is_decode() and bs == num_actual_tokens == 1
+            from sglang.kernels.ops.attention.xpu_gdn_decode import recurrent_only
+            return recurrent_only(
+                mixed, projected_states_ba[:, 32:], projected_states_ba[:, :32],
+                layer.A_log, layer.dt_bias, ssm_states, cache_indices, z,
+            )
+
+        if (
+            envs.SGLANG_XPU_GDN_DECODE.get()
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and bs == num_actual_tokens == 1
+            and layer.activation in ("silu", "swish")
+            and (layer.num_k_heads, layer.num_v_heads) == (16, 32)
+            and (layer.head_k_dim, layer.head_v_dim) == (128, 128)
+            and cache_indices.shape == (1,)
+            and cache_indices.device == device
+            and cache_indices.dtype in (torch.int32, torch.int64)
+            and cache_indices.is_contiguous()
+        ):
+            from sglang.kernels.ops.attention.xpu_gdn_decode import (
+                can_use_xpu_gdn_decode,
+                xpu_gdn_decode,
+            )
+
+            if can_use_xpu_gdn_decode(
+                projected_states_qkvz,
+                projected_states_ba,
+                conv_states,
+                ssm_states,
+                layer.conv_weights,
+                layer.bias,
+                layer.A_log,
+                layer.dt_bias,
+            ):
+                if not getattr(self, "_b70_decode_logged", False):
+                    logger.info(
+                        "Using B70 single-token GDN decode: FP32 conv products, "
+                        "BF16 a+dt_bias, FP32 beta."
+                    )
+                    self._b70_decode_logged = True
+                return xpu_gdn_decode(
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    conv_states,
+                    ssm_states,
+                    layer.conv_weights,
+                    layer.A_log,
+                    layer.dt_bias,
+                    cache_indices,
+                )
+
+        if getattr(fm, "has_mamba_track_mask", False):
+            return self._forward_tracked_prefill(
+                layer, forward_batch, projected_states_qkvz, projected_states_ba,
+                conv_states, ssm_states, cache_indices,
+            )
+
         if forward_batch.forward_mode.is_decode_or_idle():
             num_decodes, num_prefills = bs, 0
-            has_initial_state = torch.ones(bs, dtype=torch.bool, device=device)
+            has_initial_state = self._decode_initial_state(bs, device)
         else:
             num_decodes, num_prefills = 0, bs
             has_initial_state = forward_batch.extend_prefix_lens > 0
 
+        return self._run_pool_gdn(
+            layer, projected_states_qkvz, projected_states_ba, conv_states,
+            ssm_states, cache_indices, query_start_loc, has_initial_state,
+            num_prefills=num_prefills, num_decodes=num_decodes,
+        )
+
+    def _forward_tracked_prefill(self, layer, fb, qkvz, ba, conv, ssm, indices):
+        """Checkpoint the same native prefill at the requested radix boundary.
+
+        Metadata is already on CPU. The common all-final case keeps the full
+        batched kernel; an interior boundary splits only that request at an
+        aligned checkpoint. Every segment writes its live private slot, and
+        copying to the extra-buffer slot leaves the shared prefix immutable.
+        """
+        masks = fb.mamba_prefill_track_mask_cpu
+        lengths = fb.extend_seq_lens_cpu
+        prefixes = fb.extend_prefix_lens_cpu
+        # Match ForwardBatch.mamba_track_aligned_lens(). The scheduler encodes
+        # an unaligned sequence end (or boundary+1) to request an intermediate
+        # state. Saving at that encoded offset corrupts the aligned radix state.
+        chunk_size = mamba_cache_chunk_size()
+        cuts = [((int(end) - int(prefix)) // chunk_size) * chunk_size
+                if mask else int(length)
+                for mask, end, prefix, length in zip(
+                    masks, fb.mamba_track_seqlens_cpu, prefixes, lengths)]
+        if any(mask and not 0 < cut <= int(length)
+               for mask, cut, length in zip(masks, cuts, lengths)):
+            raise ValueError("Invalid native GDN prefill checkpoint boundary")
+
+        def save(row):
+            src = indices[row:row + 1].long()
+            dst = fb.mamba_track_indices[row:row + 1].long()
+            conv.index_copy_(0, dst, conv.index_select(0, src))
+            ssm.index_copy_(0, dst, ssm.index_select(0, src))
+
+        if all(cut == int(length) for cut, length in zip(cuts, lengths)):
+            result = self._run_pool_gdn(
+                layer, qkvz, ba, conv, ssm, indices,
+                self.forward_metadata.query_start_loc, fb.extend_prefix_lens > 0,
+                num_prefills=fb.batch_size, num_decodes=0,
+            )
+            for row, mask in enumerate(masks):
+                if mask:
+                    save(row)
+            return result
+
+        output = torch.empty((qkvz.shape[0], layer.num_v_heads, layer.head_v_dim),
+                             dtype=qkvz.dtype, device=qkvz.device)
+        z = torch.empty_like(output)
+        offset = 0
+        for row, (length, cut, prefix, mask) in enumerate(zip(lengths, cuts, prefixes, masks)):
+            length = int(length)
+            segments = ((0, cut), (cut, length)) if cut < length else ((0, length),)
+            for begin, end in segments:
+                qsl = torch.tensor([0, end - begin], dtype=torch.int32, device=qkvz.device)
+                has_initial = torch.tensor([int(prefix) > 0 or begin > 0], device=qkvz.device)
+                part, part_z = self._run_pool_gdn(
+                    layer, qkvz[offset + begin:offset + end], ba[offset + begin:offset + end],
+                    conv, ssm, indices[row:row + 1], qsl, has_initial,
+                    num_prefills=1, num_decodes=0,
+                )
+                output[offset + begin:offset + end].copy_(part)
+                z[offset + begin:offset + end].copy_(part_z)
+                if mask and end == cut:
+                    save(row)
+            offset += length
+        return output, z
+
+    @staticmethod
+    def _run_pool_gdn(layer, projected_states_qkvz, projected_states_ba,
+                      conv_states, ssm_states, cache_indices, query_start_loc,
+                      has_initial_state, *, num_prefills, num_decodes):
+        num_actual_tokens = projected_states_qkvz.shape[0]
+        dtype, device = projected_states_qkvz.dtype, projected_states_qkvz.device
         # Full-pool, zero-copy: transposed view for conv + native ssm pool, indexed
         # directly by the full-pool cache indices.
         conv_view = conv_states.transpose(1, 2)  # [cache, width-1, dim] view

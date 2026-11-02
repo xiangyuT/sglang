@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -9,6 +10,9 @@ import triton
 import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.utils import is_hip
 
 
@@ -33,6 +37,12 @@ def qsa_fast_topk(
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
+    if logits.device.type == "xpu":
+        from sglang.kernels.ops.attention.xpu_qsa_sycl import try_prefill_topk
+
+        selected = try_prefill_topk(logits, starts, row_ends, topk)
+        if selected is not None:
+            return selected
     if logits.is_cuda:
         if is_batch_invariant_mode_enabled() and not is_hip():
             from flashinfer import TopKTieBreak, top_k_ragged_transform
@@ -73,9 +83,19 @@ def qsa_fast_topk(
         dtype=torch.int32,
         device=logits.device,
     )
-    for row in range(logits.shape[0]):
-        start = int(starts[row])
-        length = int(lengths[row])
+    # This fallback is eager. Copy all XPU bounds together instead of
+    # synchronizing twice per row; keep the same 1D top-k calls and relative IDs.
+    if (
+        logits.device.type == "xpu"
+        and os.environ.get("SGLANG_XPU_QSA_PREFILL_BATCHED_BOUNDS") == "1"
+    ):
+        bounds = torch.stack((starts, lengths), dim=1).cpu().tolist()
+    else:
+        bounds = (
+            (int(starts[row]), int(lengths[row]))
+            for row in range(logits.shape[0])
+        )
+    for row, (start, length) in enumerate(bounds):
         width = min(length, topk)
         if width:
             output[row, :width] = torch.topk(
@@ -275,6 +295,18 @@ def expand_qsa_block_indices(
             compress_ratio,
             token_topk,
         )
+    if block_indices.device.type == "xpu":
+        from sglang.kernels.ops.attention.xpu_qsa_sycl import (
+            can_expand_blocks,
+            expand_blocks,
+        )
+
+        if can_expand_blocks(
+            block_indices, query_positions, sequence_lengths, compress_ratio, token_topk
+        ):
+            return expand_blocks(
+                block_indices, query_positions, sequence_lengths, compress_ratio, token_topk
+            )
     return torch_expand_qsa_block_indices(
         block_indices,
         query_positions,
@@ -304,6 +336,30 @@ def qsa_sparse_attention(
         raise ValueError("Q/K/V head dimensions must match")
     if q.shape[1] % k_cache.shape[1] != 0:
         raise ValueError("query heads must be divisible by KV heads")
+    if k_cache.dtype == torch.int8 or v_cache.dtype == torch.int8:
+        from sglang.kernels.ops.attention.xpu_qsa_sycl import sparse_attention
+
+        return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale, int8=True)
+    if q.device.type == "xpu":
+        from sglang.kernels.ops.attention.xpu_qsa_sycl import (
+            available,
+            sparse_attention,
+        )
+
+        if available(q, k_cache, v_cache, token_slots):
+            return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
+        return _xpu_qsa_sparse_attention_eager(
+            q, k_cache, v_cache, token_slots, softmax_scale
+        )
+    return qsa_sparse_attention_reference(
+        q, k_cache, v_cache, token_slots, softmax_scale
+    )
+
+
+@eager_on_graph(True)
+def _xpu_qsa_sparse_attention_eager(q, k_cache, v_cache, token_slots, softmax_scale):
+    # The existing reference gathers a data-dependent number of valid slots.
+    # Run it outside captured segments and copy its live output at each replay.
     return qsa_sparse_attention_reference(
         q, k_cache, v_cache, token_slots, softmax_scale
     )

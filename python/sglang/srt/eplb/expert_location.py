@@ -25,6 +25,7 @@ import torch
 import torch.distributed
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -142,7 +143,29 @@ class ExpertLocationMetadata:
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
-        physical_to_logical_map = physical_to_logical_map.to(get_device().device)
+        target_device = get_device().device
+        parallel = get_parallel()
+        cpu_metadata = (
+            envs.SGLANG_XPU_TP_CPU_EXPERT_METADATA.get()
+            and torch.device(target_device).type == "xpu"
+            and parallel.tp_size in (2, 4)
+            and parallel.pp_size == parallel.nnodes == 1
+            and (
+                parallel.moe_ep_size == 1
+                or (envs.SGLANG_XPU_EP_SAFE_ROUTES.get()
+                    and parallel.moe_ep_size in (2, 4))
+            )
+            and physical_to_logical_map.shape in ((40, 256), (40, 384))
+        )
+        # Build the initialization's integer lookup tables on the host. The
+        # original mapping helper reads each entry with .item(); moving an
+        # already-host-resident initial map to XPU first introduces thousands
+        # of scalar D2H synchronizations. Own the CPU copy to preserve aliasing.
+        physical_to_logical_map = (
+            physical_to_logical_map.detach().cpu().clone()
+            if cpu_metadata
+            else physical_to_logical_map.to(target_device)
+        )
 
         common = ExpertLocationMetadata._init_common(model_config)
 
@@ -166,12 +189,23 @@ class ExpertLocationMetadata:
             moe_ep_rank=moe_ep_rank,
         )
 
-        return ExpertLocationMetadata._init_raw(
+        metadata = ExpertLocationMetadata._init_raw(
             ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
             moe_ep_rank=moe_ep_rank,
         )
+        if cpu_metadata:
+            for name in (
+                "physical_to_logical_map", "logical_to_all_physical_map",
+                "logical_to_all_physical_map_num_valid",
+                "logical_to_rank_dispatch_physical_map",
+            ):
+                tensor = getattr(metadata, name)
+                if tensor is not None:
+                    setattr(metadata, name, tensor.to(target_device))
+            logger.info("XPU TP expert metadata initialized on CPU; integer maps uploaded")
+        return metadata
 
     @staticmethod
     def init_by_eplb(

@@ -69,6 +69,12 @@ class StandardDispatchOutput(NamedTuple):
     # either a (q, scale) pair (per-token-group-128 fp8, q rows padded to a
     # multiple of 4) or an ``Mxfp8RoutedInputPreQuant``.
     hidden_states_pre_quant: Optional[Tuple] = None
+    # When present, top-k IDs remain logical until the XPU FP8 runner maps them.
+    # Contains the verified immutable [logical, rank] table and this EP rank.
+    xpu_replica_routing: Optional[Tuple[torch.Tensor, int]] = None
+    # Only the owning GGUF resident consumer may defer this canonical map.
+    # The top-k IDs remain global and routing weights remain unchanged.
+    xpu_gguf_resident_routing: Optional[Tuple[object, torch.Tensor]] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -95,6 +101,12 @@ def _map_topk_ids_to_local_experts(
     topk_ids: torch.Tensor, local_expert_mapping: torch.Tensor
 ) -> torch.Tensor:
     """Map global expert ids while preserving the ``-1`` drop sentinel."""
+    if topk_ids.device.type == "xpu":
+        from sglang.kernels.ops.moe.xpu_tp_expert_gu_sycl import try_ep_local_ids
+
+        local = try_ep_local_ids(topk_ids, local_expert_mapping)
+        if local is not None:
+            return local
     return torch.where(
         topk_ids < 0,
         -1,
@@ -139,6 +151,8 @@ class StandardDispatcher(BaseDispatcher):
         self.moe_ep_rank = get_parallel().moe_ep_rank
         self.local_expert_mapping = None
         self.expert_mask_gpu = None
+        self.xpu_replica_balance = _envs.SGLANG_XPU_EP_REPLICA_BALANCE.get()
+        self._xpu_replica_table = None
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -192,7 +206,34 @@ class StandardDispatcher(BaseDispatcher):
             hidden_states = hidden_states
             hidden_states_scale = None
 
-        if (
+        replica_routing = None
+        if self.xpu_replica_balance:
+            from sglang.kernels.ops.moe.xpu_ep_replica_sycl import (
+                prepare_replica_table,
+                replica_local_ids,
+            )
+
+            if not TopKOutputChecker.format_is_standard(topk_output):
+                raise RuntimeError("XPU replica balance requires standard top-k output")
+            if self._xpu_replica_table is None:
+                self._xpu_replica_table = prepare_replica_table(
+                    self.num_experts,
+                    self.num_local_routed_experts,
+                    self.num_local_shared_experts,
+                    hidden_states.device,
+                )
+            if (
+                _envs.SGLANG_XPU_EP_REPLICA_FUSED_GU.get()
+                and hidden_states.shape == (1, 2048)
+            ):
+                replica_routing = (self._xpu_replica_table, self.moe_ep_rank)
+            else:
+                topk_output = topk_output._replace(
+                    topk_ids=replica_local_ids(
+                        topk_output.topk_ids, self._xpu_replica_table, self.moe_ep_rank
+                    )
+                )
+        elif (
             self.moe_ep_size > 1
             and not self.skip_local_expert_mapping
             and TopKOutputChecker.format_is_standard(topk_output)
@@ -222,6 +263,7 @@ class StandardDispatcher(BaseDispatcher):
                         )
                     )
 
+        gguf_resident_routing = None
         if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
             if self.use_aiter_moe_runner and self.expert_mask_gpu is None:
                 self.expert_mask_gpu = (
@@ -234,18 +276,32 @@ class StandardDispatcher(BaseDispatcher):
                 )
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_ids_local = _map_topk_ids_to_local_experts(
-                        topk_output.topk_ids, self.local_expert_mapping
-                    )
+                    preparation = getattr(self, "_xpu_gguf_resident_preparation", None)
+                    mask_padding = _MASK_DP_PAD_MOE and is_dp_max_padding()
+                    if (
+                        preparation is not None
+                        and replica_routing is None
+                        and not mask_padding
+                        and preparation.supports_deferred_mapping(
+                            hidden_states, topk_output.topk_ids, self.local_expert_mapping
+                        )
+                    ):
+                        gguf_resident_routing = (preparation, self.local_expert_mapping)
+                        topk_ids_local = None
+                    else:
+                        topk_ids_local = _map_topk_ids_to_local_experts(
+                            topk_output.topk_ids, self.local_expert_mapping
+                        )
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and
                     # their expert outputs are discarded downstream — pure
                     # wasted compute (and a masked-grouped-GEMM workspace
                     # blow-up when they collide on the same top-k). -1 is the
                     # drop sentinel both the triton and deep_gemm runners honor.
-                    if _MASK_DP_PAD_MOE and is_dp_max_padding():
+                    if mask_padding:
                         mask_dp_pad_moe_topk_ids(topk_ids_local)
-                    topk_output = topk_output._replace(topk_ids=topk_ids_local)
+                    if topk_ids_local is not None:
+                        topk_output = topk_output._replace(topk_ids=topk_ids_local)
                 elif TopKOutputChecker.format_is_triton_kernels(topk_output):
                     raise NotImplementedError()
 
@@ -253,6 +309,8 @@ class StandardDispatcher(BaseDispatcher):
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
             topk_output=topk_output,
+            xpu_replica_routing=replica_routing,
+            xpu_gguf_resident_routing=gguf_resident_routing,
         )
 
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:

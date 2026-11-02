@@ -20,6 +20,7 @@ import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Tuple, Union
 
+import os
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
@@ -354,6 +355,16 @@ class EagerRunner(BaseRunner):
                     forward_batch,
                     **kwargs,
                 )
+        if (os.environ.get("SGLANG_XPU_GGUF_PREFILL_TRIM_CACHE") == "1"
+                and str(model_runner.device).startswith("xpu")
+                and model_runner.server_args.quantization == "gguf"
+                and len(forward_batch.input_ids) > 4
+                and not forward_batch.forward_mode.is_target_verify()
+                and not torch.xpu.is_current_stream_capturing()):
+            # Long eager GGUF prefill creates transient reconstructed matrices
+            # and route tensors. Release only unused allocator blocks before
+            # decode; model, graph and persistent expert arenas stay owned.
+            torch.xpu.empty_cache()
         return ret
 
     def _execute_extend_cp(

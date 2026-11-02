@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups import model_override_base
@@ -441,7 +442,14 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
     if get_platform().is_xpu:
-        return False
+        # Native GGUF GDN implements final/interior prefill snapshots and
+        # accepted-prefix commits into distinct extra-buffer slots.
+        return (
+            hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration"
+            and getattr(view, "quantization", None) == "gguf"
+            and view.linear_attn_backend == "intel_xpu"
+            and os.environ.get("SGLANG_XPU_GGUF_GDN_SYCL") == "1"
+        )
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer

@@ -568,7 +568,9 @@ class GroupCoordinator:
 
         self.xpu_communicator: Optional[XpuCommunicator] = None
         if use_xpu_communicator and self.world_size > 1:
-            self.xpu_communicator = XpuCommunicator(group=self.device_group)
+            self.xpu_communicator = XpuCommunicator(
+                group=self.device_group, cpu_group=self.cpu_group
+            )
 
         self.npu_communicator: Optional[NpuCommunicator] = None
         if use_npu_communicator and self.world_size > 1:
@@ -723,6 +725,15 @@ class GroupCoordinator:
             return self.hpu_communicator.all_reduce(input_)
 
         if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
+            from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+                is_capturing,
+            )
+
+            peer = self.xpu_communicator.peer_allreduce
+            if peer is not None and not torch.compiler.is_compiling() and peer.can_use(input_):
+                return self.xpu_communicator.all_reduce(input_)
+            if is_capturing():
+                return self.xpu_communicator.all_reduce(input_)
             # Route through inplace_all_reduce custom op so Dynamo treats this as
             # an opaque call and does not decompose it into _c10d_functional primitives
             # (which invoke sycl_event.wait() and break XPU graph capture).
@@ -1295,6 +1306,9 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        xpu = self.xpu_communicator
+        if xpu is not None and not xpu.disabled and xpu.can_native_all_gather(output, input):
+            return xpu.all_gather_into_tensor(output, input)
         # Aiter custom all-gather (ROCm). Set SGLANG_USE_AITER_AG=0 to disable.
         # Aiter's should_custom_ag still owns shape/layout validation:
         # 16B alignment, weak-contiguous, supported topology, and per-rank
@@ -1369,6 +1383,13 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
+            from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+                is_capturing,
+            )
+
+            if is_capturing():
+                return self.xpu_communicator.all_gather_into_tensor(output, input)
         if _is_npu or _is_cpu:
             # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)

@@ -63,6 +63,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     ENABLE_PDL: tl.constexpr,
     WEIGHT_SHIFT: tl.constexpr = 1.0,
     EXPLICIT_ROPE_FMA: tl.constexpr = False,
+    ROUND_ROPE_PRODUCTS: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -124,7 +125,15 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     sin = tl.load(
         cos_sin_cache_ptr + cache_off + HALF_ROTARY + rot_offs, mask=rot_mask, other=0.0
     ).to(tl.float32)
-    if EXPLICIT_ROPE_FMA:
+    if ROUND_ROPE_PRODUCTS:
+        # Match native XPU RoPE: each product rounds before the add/subtract.
+        first = (xr1 * cos).to(out_dtype).to(tl.float32) - (xr2 * sin).to(out_dtype).to(
+            tl.float32
+        )
+        second = (xr2 * cos).to(out_dtype).to(tl.float32) + (xr1 * sin).to(
+            out_dtype
+        ).to(tl.float32)
+    elif EXPLICIT_ROPE_FMA:
         first = tl.fma(xr1, cos, -libdevice.mul_rn(xr2, sin))
         second = tl.fma(xr2, cos, libdevice.mul_rn(xr1, sin))
     else:
@@ -160,6 +169,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     rotary_dim: int,
     has_gate: bool = True,
     mrope_axis_map: Optional[torch.Tensor] = None,
+    round_rope_products: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave.
 
@@ -171,6 +181,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         positions: [T] token positions, or [3, T] mrope rows (temporal, height, width)
         mrope_axis_map: [rotary_dim // 2] — the axis owning each rotary lane, from
             MRotaryEmbedding
+        round_rope_products: preserve native XPU low-precision product boundaries.
     """
     assert positions.dim() in (1, 2), f"want [T] or [3, T], got {positions.shape}"
     mrope = positions.dim() == 2
@@ -230,6 +241,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         HAS_GATE=has_gate,
         MROPE=mrope,
         ENABLE_PDL=_ENABLE_PDL,
+        ROUND_ROPE_PRODUCTS=round_rope_products,
     )
 
     return q_out, k_out, gate_out if has_gate else None

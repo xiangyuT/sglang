@@ -1539,7 +1539,11 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
+        ar_joint=None,
     ):
+        if ar_joint is not None:
+            assert not self._use_ascend_fuseep and not is_in_tc_piecewise_cuda_graph()
+            return self.forward_impl(hidden_states, topk_output, pre_quant_input=pre_quant_input, ar_joint=ar_joint)
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
@@ -1580,6 +1584,7 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
+        ar_joint=None,
     ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
@@ -1594,6 +1599,7 @@ class FusedMoE(torch.nn.Module):
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
+            **({"ar_joint": ar_joint} if ar_joint is not None else {}),
         )
 
         if self._dwdp_bound:
@@ -1655,7 +1661,10 @@ class FusedMoE(torch.nn.Module):
 
         return self.dispatcher.combine(combine_input=combine_input)
 
-    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
+    def run_moe_core(self, dispatch_output: DispatchOutput, ar_joint=None) -> CombineInput:
+        if ar_joint is not None:
+            assert type(self.quant_method).__name__ == "PagedExpertsMoEMethod"
+            return self.quant_method.apply(layer=self, dispatch_output=dispatch_output, ar_joint=ar_joint)
         # TODO: consider using symmetric memory
         return self.quant_method.apply(
             layer=self,

@@ -9,12 +9,11 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -49,6 +48,7 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.utils import is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from torch import nn
 
 _is_npu = is_npu()
 if _is_npu:
@@ -62,6 +62,14 @@ except ImportError:
 
 
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    if envs.SGLANG_XPU_PAGED_DFLASH.get() and envs.SGLANG_XPU_DFLASH_TOPK.get():
+        from sglang.kernels.ops.speculative.dflash_topk_xpu import (
+            can_use_xpu_dflash_topk,
+            xpu_dflash_topk,
+        )
+
+        if can_use_xpu_dflash_topk(scores, k):
+            return xpu_dflash_topk(scores, k)
     # The selector's largest single cost: it reads the whole logits tensor.
     if _flashinfer_top_k is not None:
         return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
@@ -1114,11 +1122,17 @@ class CandidateSelector(nn.Module):
     ) -> None:
         super().__init__()
         if _flashinfer_top_k is None:
-            logger.warning(
-                "flashinfer is unavailable; the DFlash2 selector falls back to "
-                "torch.topk, which roughly halves end-to-end throughput on a large "
-                "vocabulary."
-            )
+            if envs.SGLANG_XPU_PAGED_DFLASH.get() and envs.SGLANG_XPU_DFLASH_TOPK.get():
+                logger.info(
+                    "DFLASH selector: eligible B70 BF16 top-16 uses the XPU kernel; "
+                    "unsupported layouts use torch.topk."
+                )
+            else:
+                logger.warning(
+                    "flashinfer is unavailable; the DFlash2 selector falls back to "
+                    "torch.topk, which roughly halves end-to-end throughput on a large "
+                    "vocabulary."
+                )
         state_rank = int(state_rank)
         self.top_k = int(top_k)
         self.predecessor_codebook = nn.Parameter(
@@ -1238,6 +1252,41 @@ class DFlash2DraftModel(DFlashDraftModel):
         # The draft has no head of its own; the worker points this at the target's
         # before capture.
         self.lm_head: Optional[nn.Module] = None
+        self._xpu_candidate_head: Optional[nn.Module] = None
+
+    def prepare_xpu_candidate_head(self) -> None:
+        """Create the draft-only FP8 head before graph capture, when eligible."""
+        if (
+            self._xpu_candidate_head is not None
+            or not envs.SGLANG_XPU_PAGED_DFLASH.get()
+            or not envs.SGLANG_XPU_DFLASH_FP8_DRAFT_HEAD.get()
+        ):
+            return
+        from sglang.kernels.ops.speculative.dflash_head_xpu import (
+            XpuDflashCandidateHead,
+            can_prepare_candidate_head,
+            shared_candidate_head,
+        )
+
+        if can_prepare_candidate_head(self.lm_head, get_parallel().tp_size):
+            rerank = envs.SGLANG_XPU_DFLASH_DRAFT_HEAD_RERANK.get()
+            if rerank not in (0, 64):
+                raise ValueError("SGLANG_XPU_DFLASH_DRAFT_HEAD_RERANK must be 0 or 64")
+            if envs.SGLANG_XPU_DFLASH_DRAFT_RERANK_SYCL.get() and rerank != 64:
+                raise ValueError("SYCL draft rerank requires DRAFT_HEAD_RERANK=64")
+            if rerank and self.candidate_selector.top_k != 16:
+                return
+            if envs.SGLANG_XPU_DFLASH_TARGET_HEAD_SYCL.get():
+                self._xpu_candidate_head = shared_candidate_head(self.lm_head.weight)
+            else:
+                self._xpu_candidate_head = XpuDflashCandidateHead(self.lm_head.weight)
+            if envs.SGLANG_XPU_DFLASH_DRAFT_RERANK_SYCL.get():
+                self._xpu_candidate_head.prepare_sycl_rerank(self.lm_head.weight)
+            logger.info(
+                "Using private B70 FP8 block-128 DFlash2 draft head; "
+                "original BF16 weights retained; BF16 shortlist rerank=%s",
+                rerank,
+            )
 
     def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
         logits = logits.float()
@@ -1254,6 +1303,18 @@ class DFlash2DraftModel(DFlashDraftModel):
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
         candidate_ids / unary_logits [N, K]."""
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
+        head = self._xpu_candidate_head
+        if (
+            head is not None
+            and envs.SGLANG_XPU_PAGED_DFLASH.get()
+            and envs.SGLANG_XPU_DFLASH_FP8_DRAFT_HEAD.get()
+            and head.matches(hidden, self.lm_head.weight)
+        ):
+            if envs.SGLANG_XPU_DFLASH_DRAFT_HEAD_RERANK.get() == 64:
+                vals, ids = head.refined_top16(hidden, self.lm_head.weight)
+            else:
+                vals, ids = _radix_topk(head(hidden), self.candidate_selector.top_k)
+            return ids.long(), self._transform_unary_logits(vals)
         ids, vals, _ = candidate_topk(
             hidden, self.lm_head, self.candidate_selector.top_k
         )

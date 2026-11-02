@@ -244,8 +244,20 @@ class Qwen2MoeMLP(nn.Module):
         x,
     ):
         gate_up, _ = self.gate_up_proj(x)
+        return self.forward_from_gate_up(gate_up)
+
+    def forward_from_gate_up(self, gate_up):
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
+            return x
+        from sglang.srt.layers.ar1444_shared import try_run as ar1444_shared_down
+        fused = ar1444_shared_down(self, gate_up)
+        if fused is not None:
+            return fused
+        from sglang.srt.layers.ar91_silu import try_run as ar91_silu_quant
+        quantized = ar91_silu_quant(self, gate_up)
+        if quantized is not None:
+            x, _ = self.down_proj(quantized)
             return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -512,11 +524,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
 
     def _forward_shared_experts(
-        self, hidden_states: torch.Tensor, apply_gate: bool = True
+        self, hidden_states: torch.Tensor, apply_gate: bool = True, *, projection_input=None
     ):
         shared_output = None
         if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
+            shared_output = self.shared_expert(hidden_states if projection_input is None else projection_input)
             if self.shared_expert_gate is not None and apply_gate:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
@@ -710,15 +722,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         *,
         defer_finalize: bool = False,
+        ar_joint=None,
     ):
         if _use_aiter and self.enable_shared_expert_fusion and not defer_finalize:
             from sglang.kernels.ops.moe.smallm_router_gfx950 import qwen_moe_topk_output
 
             if (topk_output := qwen_moe_topk_output(self, hidden_states)) is not None:
                 return self.experts(hidden_states, topk_output)
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        # The scoped fused path owns its router logits and planned CPU receipt.
+        from sglang.srt.layers.moe.paged_experts.router812 import try_router
+        topk_output = try_router(self, hidden_states, defer_finalize, ar_joint=ar_joint)
+        if topk_output is None:
+            router_logits, _ = self.gate(hidden_states)
+            from sglang.srt.layers.moe.paged_experts.fused37 import try_route
+            topk_output = try_route(self, hidden_states, router_logits, defer_finalize)
+            if topk_output is None:
+                topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:
                 raise RuntimeError(
@@ -734,6 +753,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output
         ):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
+        if ar_joint is not None:
+            return self.experts(hidden_states, topk_output, ar_joint=ar_joint)
         return self.experts(hidden_states, topk_output)
 
     def _gate_shared_output_out_of_place(
@@ -817,8 +838,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         defer_finalize: bool = False,
     ) -> torch.Tensor:
+        shared_projection = None
+        if isinstance(hidden_states, tuple):
+            from sglang.srt.layers.ar86_boundary import shared_projection_input
+            hidden_states, shared_projection = shared_projection_input(self, hidden_states)
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        from sglang.srt.layers.ar1502_pregate import requested as pregate_requested
+        ar1502_defer = defer_finalize and pregate_requested(self,forward_batch,hidden_states)
+        if ar1502_defer:
+            # CPU routing/shared execution stays on its original explicit path.
+            defer_finalize = False
         if defer_finalize and num_tokens == 0:
             raise RuntimeError("Qwen deferred finalize does not support M=0")
 
@@ -862,16 +892,36 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 defer_finalize=defer_finalize,
             )
         else:
-            shared_output = self._forward_shared_experts(
-                hidden_states, apply_gate=not use_fused_gate and not defer_finalize
-            )
-            if defer_finalize and shared_output is not None:
-                shared_output = self._gate_shared_output_out_of_place(
-                    hidden_states, shared_output
+            from sglang.srt.layers.ar101_joint import prepare as prepare_joint
+            ar_joint = prepare_joint(self, hidden_states, shared_projection, defer_finalize)
+            from sglang.srt.layers.ar119_cpu_shared import CPUShared, prepare as prepare_cpu_shared
+            if ar_joint is None:
+                ar_joint = prepare_cpu_shared(self, hidden_states, shared_projection, defer_finalize, use_fused_gate, deferred_gate=ar1502_defer)
+            if ar_joint is not None:
+                final_hidden_states = self._forward_router_experts(hidden_states, ar_joint=ar_joint)
+                assert ar_joint.issued, "AR101 routed call did not produce shared GU"
+                if isinstance(ar_joint, CPUShared):
+                    shared_output = ar_joint.output
+                else:
+                    shared_output = self.shared_expert.forward_from_gate_up(ar_joint.gu)
+                    if not use_fused_gate:
+                        shared_output = self._gate_shared_output_out_of_place(hidden_states, shared_output)
+            else:
+                shared_output = self._forward_shared_experts(
+                    hidden_states, apply_gate=not use_fused_gate and not defer_finalize,
+                    projection_input=shared_projection,
                 )
-            final_hidden_states = self._forward_router_experts(
-                hidden_states, defer_finalize=defer_finalize
-            )
+                if defer_finalize and shared_output is not None:
+                    shared_output = self._gate_shared_output_out_of_place(
+                        hidden_states, shared_output
+                    )
+                final_hidden_states = self._forward_router_experts(
+                    hidden_states, defer_finalize=defer_finalize
+                )
+
+        if ar1502_defer:
+            from sglang.srt.layers.ar1502_pregate import handoff
+            return handoff(self,ar_joint,hidden_states,shared_output,final_hidden_states)
 
         if defer_finalize:
             if shared_output is None:

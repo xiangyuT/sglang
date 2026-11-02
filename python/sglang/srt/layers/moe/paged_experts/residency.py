@@ -8,7 +8,7 @@ host-planned steps load that state into the policy and store it back.
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import msgspec
 import torch
@@ -45,13 +45,59 @@ class LRUPolicy:
             experts=experts, slots=[self.resident[e] for e in experts], loads=loads
         )
 
+    def prioritize(self, priorities: List[Tuple[int, int, int, int]]) -> None:
+        """Seed recency from a completed prefill without moving any weight.
 
-def plan_waves(policy: LRUPolicy, distinct: List[int]) -> List[Wave]:
+        Decode continues to use the ordinary LRU timestamps. The score sees
+        only routes already computed for this prefill chunk.
+        """
+        self.resident = OrderedDict(
+            sorted(self.resident.items(), key=lambda pair: priorities[pair[0]])
+        )
+
+
+def prefill_expert_priorities(
+    topk_ids: torch.Tensor, num_experts: int, recent_tokens: int = 64
+) -> List[Tuple[int, int, int, int]]:
+    """Priorities for CPU routing metadata: recent frequency, full frequency,
+    last token position, then logical ID. Larger tuples are kept more recent.
+    Padding contributes neither frequency nor recency.
+    """
+    if (
+        topk_ids.device.type != "cpu"
+        or topk_ids.ndim != 2
+        or topk_ids.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError(
+            "Prefill priorities require a two-dimensional CPU integer ID tensor"
+        )
+    if num_experts <= 0 or recent_tokens <= 0:
+        raise ValueError("Expert count and recent-token window must be positive")
+    if torch.any(topk_ids >= num_experts):
+        raise ValueError("Prefill route exceeds the logical expert count")
+    ids = topk_ids.reshape(-1).long()
+    valid = ids >= 0
+    full = torch.bincount(ids[valid], minlength=num_experts)
+    recent_ids = topk_ids[-recent_tokens:].reshape(-1).long()
+    recent = torch.bincount(recent_ids[recent_ids >= 0], minlength=num_experts)
+    last = torch.full((num_experts,), -1, dtype=torch.int64)
+    positions = torch.arange(topk_ids.shape[0]).repeat_interleave(topk_ids.shape[1])
+    last.scatter_reduce_(0, ids[valid], positions[valid], reduce="amax")
+    return list(zip(recent.tolist(), full.tolist(), last.tolist(), range(num_experts)))
+
+
+def plan_waves(
+    policy: LRUPolicy,
+    distinct: List[int],
+    priorities: Optional[List[Tuple[int, int, int, int]]] = None,
+) -> List[Wave]:
     """Split a step's distinct experts into waves of at most ``num_slots`` and place each.
 
     A step with no routed expert (all padding) still gets one empty wave, so the layer runs.
     """
     k = policy.num_slots
+    if priorities is not None:
+        distinct = sorted(distinct, key=lambda expert: priorities[expert])
     ordered = [e for e in distinct if e in policy.resident] + [
         e for e in distinct if e not in policy.resident
     ]

@@ -1,5 +1,4 @@
 import torch
-
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -233,6 +232,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        xpu_kwargs = (
+            {"round_gdn_gate_to_bf16": kwargs.get("native_bf16_gdn", False)}
+            if is_xpu()
+            else {}
+        )
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -254,4 +258,5 @@ class TritonGDNKernel(LinearAttnKernelBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
+            **xpu_kwargs,
         )

@@ -115,7 +115,10 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
         batch.prefill_input_ids_cpu = None
         batch.mix_running_indices = None
     elif batch.input_ids is None and future_map.spec_algo.is_none():
-        batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
+        from sglang.srt.managers.ar1564_relay import borrow_input
+        fed = borrow_input(batch, future_map)
+        batch.input_ids = (future_map.output_tokens_buf[batch.req_pool_indices]
+                           if fed is None else fed)
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
@@ -293,14 +296,23 @@ class FutureMap:
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
+        # D2H pulls (gated only on publish, off the schedule stream). CUDA uses
+        # this behind its WAR barrier. The one-request GGUF XPU opt-in reuses
+        # the same publish fence; other paths keep the plain .cpu() bootstrap.
+        private_xpu_d2h = False
+        if torch.device(self.device).type == "xpu":
+            from sglang.kernels.ops.speculative.gguf_relay_sycl import private_d2h_eligible
+
+            private_xpu_d2h = private_d2h_eligible(self.device, spec_algo, self.req_pool_size)
+        if _is_cuda or private_xpu_d2h:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
             self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream()
+            if private_xpu_d2h:
+                from sglang.kernels.ops.speculative.gguf_relay_sycl import announce_private_d2h
+
+                announce_private_d2h()
         else:
             self.new_seq_lens_cpu_pinned = None
             self.fwd_prepare_d2h_stream = None
@@ -456,12 +468,17 @@ class FutureMap:
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
             )
+            native_relay = None
+            if torch.device(self.device).type == "xpu":
+                from sglang.kernels.ops.speculative.gguf_relay_sycl import try_gather
+
+                native_relay = try_gather(self, indices)
             (
                 draft_input.topk_p,
                 draft_input.topk_index,
                 bonus_tokens,
                 hidden_states,
-            ) = gather_spec_extras(
+            ) = native_relay if native_relay is not None else gather_spec_extras(
                 indices,
                 self.topk_p_buf,
                 self.topk_index_buf,
@@ -640,6 +657,11 @@ class FutureMap:
             return
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
+        if torch.device(self.device).type == "xpu":
+            from sglang.kernels.ops.speculative.gguf_relay_sycl import try_stash
+
+            if try_stash(self, indices, payload):
+                return
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
             self.output_tokens_buf.dtype
         )
